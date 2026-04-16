@@ -1,0 +1,25 @@
+app:
+  title: ApiInOne
+  route_mode: ordered_failover
+  probe_interval_seconds: 300
+  request_timeout_ms: 120000
+  passive_window_size: 50
+
+upstreams: []
+# Example upstream:
+# - id: upstream_primary
+#   name: Primary
+#   base_url: https://api.example.com/v1
+#   api_key: your-real-upstream-api-key
+#   enabled: true
+#   order: 1
+#   allowed_models:
+#     - gpt-5.4
+#     - gpt-4.1
+#   timeout_ms: 120000
+#   probe_enabled: true
+#   endpoint_capabilities:
+#     - "*"
+#   models_detected_at: null
+
+proxy_keys: []

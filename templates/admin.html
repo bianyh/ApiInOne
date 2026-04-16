@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+  </head>
+  <body>
+    {% raw %}
+    <div class="ambient-layer" aria-hidden="true">
+      <div class="ambient-orb orb-a"></div>
+      <div class="ambient-orb orb-b"></div>
+      <div class="ambient-grid"></div>
+    </div>
+    <div id="app" v-cloak>
+      <div v-if="!session.authenticated" class="login-shell">
+        <div class="login-panel">
+          <section class="login-brand">
+            <span class="eyebrow">Private Relay Console</span>
+            <h1>{{ pageTitle }}</h1>
+            <p>把多个上游模型入口统一收口到一个地址，并且在同一个后台里完成节点管理、代理 Key 分发、调用统计和健康探测。</p>
+            <div class="login-feature-list">
+              <div class="login-feature">
+                <strong>多上游切换</strong>
+                <span>按顺序故障切换，或按测速优选。</span>
+              </div>
+              <div class="login-feature">
+                <strong>纯后端托管</strong>
+                <span>启动 Flask 服务后，前端即刻可用。</span>
+              </div>
+              <div class="login-feature">
+                <strong>按 Key 统计</strong>
+                <span>查看每个代理 Key 的调用明细和趋势。</span>
+              </div>
+            </div>
+          </section>
+
+          <el-card shadow="never" class="login-card">
+            <template #header>
+              <div class="section-heading">
+                <div>
+                  <span class="eyebrow">Admin Access</span>
+                  <h3>登录管理台</h3>
+                </div>
+              </div>
+            </template>
+            <el-form @submit.prevent="submitLogin" label-position="top">
+              <el-form-item label="用户名">
+                <el-input v-model="loginForm.username" autocomplete="username"></el-input>
+              </el-form-item>
+              <el-form-item label="密码">
+                <el-input v-model="loginForm.password" type="password" autocomplete="current-password" show-password></el-input>
+              </el-form-item>
+              <el-alert v-if="loginError" :title="loginError" type="error" show-icon :closable="false"></el-alert>
+              <el-button class="submit-button" type="primary" @click="submitLogin" :loading="loading.session">
+                进入后台
+              </el-button>
+            </el-form>
+          </el-card>
+        </div>
+      </div>
+
+      <div v-else class="app-shell">
+        <aside class="sidebar">
+          <div class="sidebar-brand">
+            <span class="eyebrow">Relay Control</span>
+            <h2>{{ pageTitle }}</h2>
+            <p>{{ routeModeLabel(settings.route_mode) }}</p>
+          </div>
+
+          <div class="sidebar-summary">
+            <div class="summary-chip">
+              <span>已启用节点</span>
+              <strong>{{ enabledUpstreamCount }}</strong>
+            </div>
+            <div class="summary-chip">
+              <span>代理 Key</span>
+              <strong>{{ proxyKeys.length }}</strong>
+            </div>
+            <div class="summary-chip">
+              <span>最近 {{ statsDays }} 天</span>
+              <strong>{{ formatNumber(stats.summary.total_requests) }}</strong>
+            </div>
+          </div>
+
+          <nav class="nav-list">
+            <button
+              v-for="item in navItems"
+              :key="item.key"
+              class="nav-button"
+              :class="{ active: activeTab === item.key }"
+              @click="handleTabChange(item.key)"
+            >
+              <span>{{ item.label }}</span>
+              <small>{{ item.hint }}</small>
+            </button>
+          </nav>
+
+          <div class="sidebar-footer">
+            <div class="sidebar-user">
+              <span>当前管理员</span>
+              <strong>{{ session.username }}</strong>
+            </div>
+            <el-button class="logout-button" plain @click="logout">退出登录</el-button>
+          </div>
+        </aside>
+
+        <main class="workspace">
+          <header class="workspace-header">
+            <div class="workspace-title">
+              <span class="eyebrow">Workspace</span>
+              <h1>{{ tabTitle }}</h1>
+              <p>{{ tabDescription }}</p>
+              <div class="header-pills">
+                <span class="header-pill">{{ routeModeLabel(settings.route_mode) }}</span>
+                <span class="header-pill">健康节点 {{ healthyUpstreamCount }}</span>
+                <span class="header-pill">识别模型 {{ uniqueModelCount }}</span>
+              </div>
+            </div>
+            <div class="workspace-actions">
+              <el-select v-model="statsDays" @change="refreshStats">
+                <el-option :value="1" label="近1天"></el-option>
+                <el-option :value="7" label="近7天"></el-option>
+                <el-option :value="30" label="近30天"></el-option>
+              </el-select>
+              <el-button type="primary" @click="refreshAll" :loading="loading.refresh">刷新数据</el-button>
+            </div>
+          </header>
+
+          <section v-show="activeTab === 'overview'" class="stack-layout">
+            <div class="hero-card">
+              <div class="hero-main">
+                <span class="eyebrow">Setup Guide</span>
+                <h3>最快的使用路径</h3>
+                <p>先添加上游节点并自动探查模型，再创建代理 Key，最后把你其他机器的 `base_url` 指向这个中转站。</p>
+                <div class="hero-actions">
+                  <el-button type="primary" @click="handleTabChange('upstreams')">先添加节点</el-button>
+                  <el-button @click="handleTabChange('keys')">再创建代理 Key</el-button>
+                </div>
+              </div>
+              <div class="hero-steps">
+                <div class="step-card" :class="{ complete: upstreams.length > 0 }">
+                  <span>01</span>
+                  <strong>添加上游</strong>
+                  <small>{{ upstreams.length > 0 ? '已配置节点' : '填写 Base URL 和 API Key' }}</small>
+                </div>
+                <div class="step-card" :class="{ complete: proxyKeys.length > 0 }">
+                  <span>02</span>
+                  <strong>创建代理 Key</strong>
+                  <small>{{ proxyKeys.length > 0 ? '已可供客户端接入' : '生成给客户端使用的 Bearer Key' }}</small>
+                </div>
+                <div class="step-card" :class="{ complete: stats.summary.total_requests > 0 }">
+                  <span>03</span>
+                  <strong>开始转发</strong>
+                  <small>{{ stats.summary.total_requests > 0 ? '已经有调用流量' : '把客户端 base_url 指向 /v1' }}</small>
+                </div>
+              </div>
+            </div>
+
+            <div class="metric-grid">
+              <div class="metric-card strong">
+                <span>调用总数</span>
+                <strong>{{ formatNumber(stats.summary.total_requests) }}</strong>
+                <small>成功 {{ formatNumber(stats.summary.success_requests) }} / 失败 {{ formatNumber(stats.summary.error_requests) }}</small>
+              </div>
+              <div class="metric-card">
+                <span>总 Tokens</span>
+                <strong>{{ formatNumber(stats.summary.total_tokens) }}</strong>
+                <small>按最近 {{ statsDays }} 天聚合</small>
+              </div>
+              <div class="metric-card">
+                <span>平均总耗时</span>
+                <strong>{{ formatLatency(stats.summary.avg_latency_ms) }}</strong>
+                <small>完整响应耗时</small>
+              </div>
+              <div class="metric-card">
+                <span>平均首字耗时</span>
+                <strong>{{ formatLatency(stats.summary.avg_ttfb_ms) }}</strong>
+                <small>首字节到达时间</small>
+              </div>
+            </div>
+
+            <div class="chart-grid">
+              <el-card shadow="never" class="glass-card">
+                <template #header><span>请求趋势</span></template>
+                <div id="requests-chart" class="chart"></div>
+              </el-card>
+              <el-card shadow="never" class="glass-card">
+                <template #header><span>状态分布</span></template>
+                <div id="status-chart" class="chart"></div>
+              </el-card>
+              <el-card shadow="never" class="glass-card">
+                <template #header><span>热门模型</span></template>
+                <div id="models-chart" class="chart"></div>
+              </el-card>
+              <el-card shadow="never" class="glass-card">
+                <template #header><span>节点首字耗时</span></template>
+                <div id="latency-chart" class="chart"></div>
+              </el-card>
+            </div>
+
+            <el-card shadow="never" class="glass-card">
+              <template #header><span>客户端接入示例</span></template>
+              <div class="code-block">
+                <code>base_url = "http://你的服务器IP:8000/v1"</code>
+                <code>api_key = "管理台生成的 sk-relay-..."</code>
+              </div>
+            </el-card>
+          </section>
+
+          <section v-show="activeTab === 'upstreams'" class="stack-layout">
+            <div class="guide-grid">
+              <div class="guide-card guide-primary">
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Node Onboarding</span>
+                    <h3>三步添加节点</h3>
+                  </div>
+                  <div class="section-actions">
+                    <el-button type="primary" @click="openCreateUpstream">开始新增节点</el-button>
+                  </div>
+                </div>
+                <div class="wizard-steps">
+                  <div class="wizard-step" :class="{ complete: upstreams.length > 0 }">
+                    <span>1</span>
+                    <div>
+                      <strong>填写连接信息</strong>
+                      <small>输入节点名称、`base_url`、`api_key` 和超时。</small>
+                    </div>
+                  </div>
+                  <div class="wizard-step" :class="{ complete: uniqueModelCount > 0 }">
+                    <span>2</span>
+                    <div>
+                      <strong>自动探查模型</strong>
+                      <small>点击“自动探查模型”，把上游支持的模型拉回来展示出来。</small>
+                    </div>
+                  </div>
+                  <div class="wizard-step" :class="{ complete: enabledUpstreamCount > 0 }">
+                    <span>3</span>
+                    <div>
+                      <strong>保存并启用</strong>
+                      <small>保存后，客户端即可通过你的中转站访问这些模型。</small>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="guide-card guide-secondary">
+                <span class="eyebrow">Node Summary</span>
+                <div class="guide-metrics">
+                  <div class="guide-metric">
+                    <span>节点总数</span>
+                    <strong>{{ upstreams.length }}</strong>
+                  </div>
+                  <div class="guide-metric">
+                    <span>健康节点</span>
+                    <strong>{{ healthyUpstreamCount }}</strong>
+                  </div>
+                  <div class="guide-metric">
+                    <span>已识别模型</span>
+                    <strong>{{ uniqueModelCount }}</strong>
+                  </div>
+                  <div class="guide-metric">
+                    <span>默认策略</span>
+                    <strong>{{ routeModeLabel(settings.route_mode) }}</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Priority Order</span>
+                    <h3>拖拽调整使用顺序</h3>
+                  </div>
+                  <div class="section-actions">
+                    <span class="muted-inline">越靠上优先级越高，每个顺位只对应一个 API 节点。高优先级节点超时后会自动切到下一节点，并每 60 秒尝试恢复。</span>
+                  </div>
+                </div>
+              </template>
+              <div v-if="!orderedUpstreams().length" class="empty-state compact">
+                <p>添加节点后，可以在这里通过拖拽直接调整优先级。</p>
+              </div>
+              <div v-else class="priority-list">
+                <div
+                  v-for="item in orderedUpstreams()"
+                  :key="`priority-${item.id}`"
+                  class="priority-item"
+                  :class="{ dragging: draggingUpstreamId === item.id, failover: healthSnapshot(item).timeout_failover_active }"
+                  draggable="true"
+                  @dragstart="handleUpstreamDragStart(item)"
+                  @dragend="handleUpstreamDragEnd"
+                  @dragover="allowUpstreamDrop"
+                  @drop="handleUpstreamDrop(item)"
+                >
+                  <div class="priority-item-left">
+                    <span class="drag-handle">⋮⋮</span>
+                    <span class="priority-badge">{{ item.order }}</span>
+                    <div>
+                      <strong>{{ item.name }}</strong>
+                      <small>{{ item.base_url }}</small>
+                    </div>
+                  </div>
+                  <div class="priority-item-right">
+                    <el-tag size="small" :type="item.enabled ? 'success' : 'info'">{{ item.enabled ? '启用' : '停用' }}</el-tag>
+                    <el-tag size="small" :type="healthTagType(item)">{{ healthLabel(item) }}</el-tag>
+                  </div>
+                </div>
+              </div>
+            </el-card>
+
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Upstreams</span>
+                    <h3>上游节点</h3>
+                  </div>
+                  <div class="section-actions">
+                    <el-button @click="probeAll" :loading="loading.health">刷新健康状态</el-button>
+                    <el-button type="primary" @click="openCreateUpstream">新增节点</el-button>
+                  </div>
+                </div>
+              </template>
+
+              <div v-if="!upstreams.length" class="empty-state">
+                <h4>还没有配置任何上游节点</h4>
+                <p>点击“新增节点”，填写 `base_url` 和 `api_key` 后，就可以一键探查模型并保存。</p>
+                <el-button type="primary" @click="openCreateUpstream">立即添加第一个节点</el-button>
+              </div>
+
+              <el-table v-else :data="upstreams" stripe>
+                <el-table-column prop="name" label="节点名称" min-width="160"></el-table-column>
+                <el-table-column prop="base_url" label="Base URL" min-width="260"></el-table-column>
+                <el-table-column label="模型数" min-width="100">
+                  <template #default="scope">{{ modelCount(scope.row) }}</template>
+                </el-table-column>
+                <el-table-column label="模型列表" min-width="320">
+                  <template #default="scope">
+                    <div v-if="modelCount(scope.row)" class="model-preview-cell">
+                      <el-tag
+                        v-for="model in previewModels(scope.row, 4)"
+                        :key="`${scope.row.id}-${model}`"
+                        class="model-preview-tag"
+                        effect="plain"
+                      >
+                        {{ model }}
+                      </el-tag>
+                      <el-tag
+                        v-if="hiddenModelCount(scope.row, 4) > 0"
+                        class="model-preview-tag"
+                        type="info"
+                        effect="plain"
+                      >
+                        +{{ hiddenModelCount(scope.row, 4) }}
+                      </el-tag>
+                    </div>
+                    <span v-else class="muted-inline">未探查</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="状态" min-width="120">
+                  <template #default="scope">
+                    <el-tag :type="healthTagType(scope.row)">{{ healthLabel(scope.row) }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="order" label="顺序" min-width="80"></el-table-column>
+                <el-table-column label="探查时间" min-width="180">
+                  <template #default="scope">{{ formatDateTime(scope.row.models_detected_at) }}</template>
+                </el-table-column>
+                <el-table-column label="启用" min-width="90">
+                  <template #default="scope">
+                    <el-tag :type="scope.row.enabled ? 'success' : 'info'">{{ scope.row.enabled ? '启用' : '停用' }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="操作" min-width="300" fixed="right">
+                  <template #default="scope">
+                    <div class="table-actions">
+                      <el-button class="table-action-button action-edit" size="small" @click="openEditUpstream(scope.row)">编辑</el-button>
+                      <el-button class="table-action-button action-discover" size="small" @click="quickDiscoverUpstream(scope.row)">探查模型</el-button>
+                      <el-button class="table-action-button action-probe" size="small" @click="probeOne(scope.row.id)">探活</el-button>
+                      <el-button class="table-action-button action-delete" size="small" @click="removeUpstream(scope.row)">删除</el-button>
+                    </div>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </el-card>
+          </section>
+
+          <section v-show="activeTab === 'keys'" class="stack-layout two-column-layout">
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Proxy Keys</span>
+                    <h3>创建代理 Key</h3>
+                  </div>
+                </div>
+              </template>
+              <el-form label-position="top">
+                <el-form-item label="名称">
+                  <el-input v-model="newKey.name" placeholder="例如：办公电脑 / 个人脚本 / 手机"></el-input>
+                </el-form-item>
+                <el-form-item label="备注">
+                  <el-input v-model="newKey.note" type="textarea" :rows="4" placeholder="可选备注"></el-input>
+                </el-form-item>
+                <el-button type="primary" @click="createProxyKey" :loading="loading.keys">创建 Key</el-button>
+              </el-form>
+              <el-alert
+                v-if="newlyCreatedKey"
+                class="spaced-alert"
+                type="success"
+                show-icon
+                :closable="false"
+                title="新 Key 只展示一次，请立即保存"
+              >
+                <template #default>
+                  <code>{{ newlyCreatedKey }}</code>
+                </template>
+              </el-alert>
+            </el-card>
+
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Issued Keys</span>
+                    <h3>代理 Key 列表</h3>
+                  </div>
+                </div>
+              </template>
+              <div v-if="!proxyKeys.length" class="empty-state compact">
+                <p>还没有创建任何代理 Key。</p>
+              </div>
+              <div v-else class="key-stack">
+                <div v-for="item in proxyKeys" :key="item.id" class="key-card">
+                  <div>
+                    <strong>{{ item.name }}</strong>
+                    <p>{{ item.note || '无备注' }}</p>
+                    <small>{{ item.key_prefix }}</small>
+                  </div>
+                  <div class="key-meta">
+                    <span>创建于 {{ formatDateTime(item.created_at) }}</span>
+                    <el-switch v-model="item.enabled" @change="toggleProxyKey(item)"></el-switch>
+                  </div>
+                </div>
+              </div>
+            </el-card>
+          </section>
+
+          <section v-show="activeTab === 'requests'" class="stack-layout">
+            <div class="metric-grid compact">
+              <div class="mini-metric">
+                <span>成功请求</span>
+                <strong>{{ formatNumber(stats.summary.success_requests) }}</strong>
+              </div>
+              <div class="mini-metric">
+                <span>失败请求</span>
+                <strong>{{ formatNumber(stats.summary.error_requests) }}</strong>
+              </div>
+              <div class="mini-metric">
+                <span>已启用节点</span>
+                <strong>{{ enabledUpstreamCount }}</strong>
+              </div>
+              <div class="mini-metric">
+                <span>代理 Key 数</span>
+                <strong>{{ proxyKeys.length }}</strong>
+              </div>
+            </div>
+
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Request Logs</span>
+                    <h3>调用明细</h3>
+                  </div>
+                  <div class="filter-bar">
+                    <el-select v-model="requestFilters.proxy_key_id" clearable placeholder="按 Key 筛选" @change="loadRequests">
+                      <el-option v-for="item in proxyKeys" :key="item.id" :label="item.name" :value="item.id"></el-option>
+                    </el-select>
+                    <el-select v-model="requestFilters.upstream_id" clearable placeholder="按节点筛选" @change="loadRequests">
+                      <el-option v-for="item in upstreams" :key="item.id" :label="item.name" :value="item.id"></el-option>
+                    </el-select>
+                    <el-select v-model="requestFilters.status_group" clearable placeholder="状态" @change="loadRequests">
+                      <el-option label="成功" value="success"></el-option>
+                      <el-option label="失败" value="error"></el-option>
+                    </el-select>
+                  </div>
+                </div>
+              </template>
+
+              <el-table :data="requests.items" stripe height="620">
+                <el-table-column prop="created_at" label="创建时间" min-width="180">
+                  <template #default="scope">{{ formatDateTime(scope.row.created_at) }}</template>
+                </el-table-column>
+                <el-table-column prop="proxy_key_name" label="Key" min-width="120"></el-table-column>
+                <el-table-column prop="upstream_name" label="节点" min-width="120"></el-table-column>
+                <el-table-column prop="model" label="模型" min-width="180"></el-table-column>
+                <el-table-column prop="input_tokens" label="输入 Tokens" min-width="120"></el-table-column>
+                <el-table-column prop="cached_tokens" label="缓存 Tokens" min-width="120"></el-table-column>
+                <el-table-column prop="output_tokens" label="输出 Tokens" min-width="120"></el-table-column>
+                <el-table-column prop="reasoning_tokens" label="推理 Tokens" min-width="120"></el-table-column>
+                <el-table-column prop="total_tokens" label="总 Tokens" min-width="120"></el-table-column>
+                <el-table-column prop="ttfb_ms" label="首字" min-width="100">
+                  <template #default="scope">{{ formatLatency(scope.row.ttfb_ms) }}</template>
+                </el-table-column>
+                <el-table-column prop="duration_ms" label="总耗时" min-width="100">
+                  <template #default="scope">{{ formatLatency(scope.row.duration_ms) }}</template>
+                </el-table-column>
+                <el-table-column prop="cache_ratio" label="缓存比率" min-width="100">
+                  <template #default="scope">{{ formatPercent(scope.row.cache_ratio) }}</template>
+                </el-table-column>
+                <el-table-column prop="fast" label="Fast" min-width="80">
+                  <template #default="scope">
+                    <el-tag :type="scope.row.fast ? 'success' : 'info'">{{ scope.row.fast ? 'Yes' : 'No' }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="million_units" label="1M" min-width="80"></el-table-column>
+                <el-table-column prop="status_code" label="状态" min-width="80"></el-table-column>
+              </el-table>
+
+              <div class="pagination-row">
+                <el-pagination
+                  background
+                  layout="prev, pager, next, sizes, total"
+                  :current-page="requestFilters.page"
+                  :page-size="requestFilters.page_size"
+                  :page-sizes="[20, 50, 100]"
+                  :total="requests.total"
+                  @current-change="handleRequestPage"
+                  @size-change="handleRequestPageSize"
+                ></el-pagination>
+              </div>
+            </el-card>
+          </section>
+
+          <section v-show="activeTab === 'health'" class="stack-layout">
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Health Checks</span>
+                    <h3>健康测速</h3>
+                  </div>
+                  <div class="section-actions">
+                    <el-button type="primary" @click="probeAll" :loading="loading.health">立即探测全部节点</el-button>
+                  </div>
+                </div>
+              </template>
+              <div class="health-grid">
+                <div v-for="item in healthItems" :key="item.id" class="health-card">
+                  <div class="health-head">
+                    <div>
+                      <strong>{{ item.name }}</strong>
+                      <p>{{ item.base_url }}</p>
+                    </div>
+                    <el-tag :type="healthTagType(item)">{{ healthLabel(item) }}</el-tag>
+                  </div>
+                  <div class="health-metrics">
+                    <span>最近探活时间: {{ formatDateTime(item.health.last_probe_at) }}</span>
+                    <span>最近探活: {{ formatLatency(item.health.last_probe_latency_ms) }}</span>
+                    <span>被动首字均值: {{ formatLatency(item.health.passive_avg_ttfb_ms) }}</span>
+                    <span>成功 / 失败: {{ item.health.passive_success || 0 }} / {{ item.health.passive_error || 0 }}</span>
+                    <span>自动切换状态: {{ item.health.timeout_failover_active ? '已切换到下级节点' : '正常' }}</span>
+                    <span v-if="item.health.timeout_failover_since">自动切换时间: {{ formatDateTime(item.health.timeout_failover_since) }}</span>
+                    <span>最近状态码: {{ item.health.last_probe_status_code || '-' }}</span>
+                    <span>探活接口: {{ item.health.last_probe_endpoint || '-' }}</span>
+                    <span>探活模型: {{ item.health.last_probe_model_used || '-' }}</span>
+                    <span>探活模型数: {{ item.health.last_probe_model_count || 0 }}</span>
+                    <span>探活回复内容: {{ item.health.last_probe_reply_excerpt || '-' }}</span>
+                    <span v-if="item.health.timeout_failover_reason">自动切换原因: {{ item.health.timeout_failover_reason }}</span>
+                    <span v-if="item.health.last_probe_error">最近问题: {{ item.health.last_probe_error }}</span>
+                  </div>
+                  <div class="probe-selector-row">
+                    <el-select v-model="probeModelSelections[item.id]" placeholder="选择探活模型">
+                      <el-option
+                        v-for="model in probeModelOptions(item)"
+                        :key="`${item.id}-probe-${model}`"
+                        :label="model"
+                        :value="model"
+                      ></el-option>
+                    </el-select>
+                    <span class="probe-selector-hint">默认使用 `gpt-5.4`，也可改成该节点已探测到的模型。</span>
+                  </div>
+                  <div v-if="probeStepTrail(item).length" class="probe-status-panel" :class="{ live: isProbingItem(item) }">
+                    <div class="probe-status-head">
+                      <div class="probe-status-title">
+                        <span v-if="isProbingItem(item)" class="probe-spinner"></span>
+                        <strong>{{ isProbingItem(item) ? '探活进行中' : '最近探活步骤' }}</strong>
+                      </div>
+                      <small>{{ currentProbeMessage(item) }}</small>
+                    </div>
+                    <div class="probe-step-list">
+                      <div
+                        v-for="step in probeStepTrail(item)"
+                        :key="`${item.id}-${step.timestamp}-${step.stage}`"
+                        class="probe-step-item"
+                        :class="step.status"
+                      >
+                        <span>{{ probeStageLabel(step.stage) }}</span>
+                        <small>{{ formatDateTime(step.timestamp) }} · {{ step.message }}</small>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="card-inline-actions">
+                    <el-button size="small" @click="quickDiscoverUpstream(item)">探查模型</el-button>
+                    <el-button size="small" type="primary" @click="probeOne(item.id)">单节点探活</el-button>
+                  </div>
+                </div>
+              </div>
+            </el-card>
+          </section>
+
+          <section v-show="activeTab === 'settings'" class="stack-layout">
+            <el-card shadow="never" class="glass-card">
+              <template #header>
+                <div class="section-heading">
+                  <div>
+                    <span class="eyebrow">Global Settings</span>
+                    <h3>全局设置</h3>
+                  </div>
+                </div>
+              </template>
+              <el-form label-position="top" class="settings-form">
+                <el-form-item label="站点标题">
+                  <el-input v-model="settings.title"></el-input>
+                </el-form-item>
+                <el-form-item label="路由模式">
+                  <el-select v-model="settings.route_mode">
+                    <el-option label="有序故障切换" value="ordered_failover"></el-option>
+                    <el-option label="按测速优选" value="fastest_first"></el-option>
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="探活间隔（秒）">
+                  <el-input-number v-model="settings.probe_interval_seconds" :min="30" :step="30"></el-input-number>
+                </el-form-item>
+                <el-form-item label="默认超时（毫秒）">
+                  <el-input-number v-model="settings.request_timeout_ms" :min="1000" :step="1000"></el-input-number>
+                </el-form-item>
+                <el-button type="primary" @click="saveSettings" :loading="loading.settings">保存设置</el-button>
+              </el-form>
+            </el-card>
+          </section>
+        </main>
+
+        <el-dialog
+          v-model="upstreamDialog.visible"
+          :title="upstreamDialog.mode === 'create' ? '新增上游节点' : '编辑上游节点'"
+          width="760px"
+          destroy-on-close
+        >
+          <div class="dialog-stack">
+            <div class="dialog-grid">
+              <el-form label-position="top">
+                <el-form-item label="节点名称">
+                  <el-input v-model="upstreamDialog.form.name" placeholder="例如：主节点 / 备用节点"></el-input>
+                </el-form-item>
+                <el-form-item label="Base URL">
+                  <el-input v-model="upstreamDialog.form.base_url" placeholder="例如 https://api.openai.com/v1"></el-input>
+                </el-form-item>
+                <div class="double-grid">
+                  <el-form-item label="当前顺序">
+                    <el-input :model-value="`第 ${upstreamDialog.form.order || '-'} 位`" disabled></el-input>
+                  </el-form-item>
+                  <el-form-item label="超时（毫秒）">
+                    <el-input-number v-model="upstreamDialog.form.timeout_ms" :min="1000" :step="1000" controls-position="right"></el-input-number>
+                  </el-form-item>
+                </div>
+                <el-form-item label="API Key">
+                  <el-input
+                    v-model="upstreamDialog.form.api_key"
+                    type="password"
+                    show-password
+                    :placeholder="upstreamDialog.form.api_key_masked || '新增节点时必填；编辑已存在节点时留空可沿用后台已保存的 Key'"
+                  ></el-input>
+                </el-form-item>
+                <el-form-item label="接口能力">
+                  <el-select v-model="upstreamDialog.form.endpoint_capabilities" multiple collapse-tags collapse-tags-tooltip>
+                    <el-option label="全部接口" value="*"></el-option>
+                    <el-option label="responses" value="responses"></el-option>
+                    <el-option label="chat.completions" value="chat.completions"></el-option>
+                    <el-option label="embeddings" value="embeddings"></el-option>
+                    <el-option label="files" value="files"></el-option>
+                    <el-option label="images" value="images"></el-option>
+                    <el-option label="audio" value="audio"></el-option>
+                  </el-select>
+                </el-form-item>
+                <div class="switch-row">
+                  <el-switch v-model="upstreamDialog.form.enabled"></el-switch>
+                  <span>启用节点</span>
+                  <el-switch v-model="upstreamDialog.form.probe_enabled"></el-switch>
+                  <span>启用探活</span>
+                </div>
+              </el-form>
+
+              <div class="model-panel">
+                <div class="model-panel-head">
+                  <div>
+                    <span class="eyebrow">Model Discovery</span>
+                    <h4>支持模型</h4>
+                  </div>
+                  <el-button type="primary" plain @click="discoverDialogModels" :loading="loading.discoverModels">
+                    自动探查模型
+                  </el-button>
+                </div>
+                <p class="helper-text">填写 `base_url` 和 `api_key` 后点击探查。编辑已有节点时，如不改 Key，可直接留空并使用后台已保存的 Key 进行探查。</p>
+                <el-alert
+                  v-if="upstreamDialog.discovery"
+                  class="spaced-alert"
+                  type="success"
+                  show-icon
+                  :closable="false"
+                  :title="dialogDiscoveryTitle"
+                ></el-alert>
+                <div class="wizard-steps compact">
+                  <div class="wizard-step compact">
+                    <span>1</span>
+                    <div>
+                      <strong>先填连接信息</strong>
+                      <small>`base_url` 和 `api_key` 是自动探查模型的前提。</small>
+                    </div>
+                  </div>
+                  <div class="wizard-step compact">
+                    <span>2</span>
+                    <div>
+                      <strong>点击自动探查</strong>
+                      <small>系统会请求上游 `/v1/models` 并同步模型列表。</small>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="dialogModelList.length" class="model-list-panel">
+                  <div class="model-list-head">
+                    <div>
+                      <span class="eyebrow">Detected Models</span>
+                      <h5>{{ dialogModelPanelTitle }}</h5>
+                    </div>
+                    <div class="model-summary-pills">
+                      <span class="model-summary-pill">模型数 {{ dialogModelList.length }}</span>
+                      <span class="model-summary-pill">{{ dialogModelSourceLabel }}</span>
+                      <span class="model-summary-pill">{{ formatDateTime(upstreamDialog.form.models_detected_at) }}</span>
+                    </div>
+                  </div>
+                  <div class="model-toolbar">
+                    <el-input
+                      v-model="upstreamDialog.modelSearch"
+                      clearable
+                      placeholder="搜索模型名"
+                    ></el-input>
+                    <el-button @click="copyDialogModels">复制模型列表</el-button>
+                  </div>
+                  <div class="model-tag-wall">
+                    <span
+                      v-for="model in filteredDialogModelList"
+                      :key="`dialog-${model}`"
+                      class="model-chip"
+                    >
+                      {{ model }}
+                    </span>
+                  </div>
+                  <div v-if="!filteredDialogModelList.length" class="mini-empty">
+                    没有匹配当前搜索条件的模型。
+                  </div>
+                </div>
+                <div class="advanced-editor-head">
+                  <span class="eyebrow">Advanced</span>
+                  <h5>高级编辑模型列表</h5>
+                </div>
+                <el-input
+                  v-model="upstreamDialog.form.allowed_models_text"
+                  type="textarea"
+                  :rows="7"
+                  placeholder="每行一个模型名。若留空，保存时会自动尝试探查。"
+                ></el-input>
+              </div>
+            </div>
+          </div>
+          <template #footer>
+            <div class="dialog-footer">
+              <el-button @click="upstreamDialog.visible = false">取消</el-button>
+              <el-button type="primary" @click="saveUpstreamDialog" :loading="loading.upstreamDialog">
+                保存节点
+              </el-button>
+            </div>
+          </template>
+        </el-dialog>
+      </div>
+    </div>
+    {% endraw %}
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/element-plus/dist/index.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <script>
+      window.RELAY_PAGE_TITLE = {{ page_title|tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='admin.js') }}"></script>
+  </body>
+</html>

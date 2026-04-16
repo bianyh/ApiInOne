@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and local runtime artifacts
+.pytest_cache/
+.pytest_tmp/
+pytest_tmp/
+test_runtime/
+tmp_priority_check.yaml
+
+# Local runtime data
+config.yaml
+data/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log
