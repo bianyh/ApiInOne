@@ -211,14 +211,22 @@ def update_settings():
 @require_admin
 def get_requests():
     args = request.args
+    try:
+        page = int(args.get("page", 1))
+        page_size = int(args.get("page_size", 50))
+        days = int(args.get("days", 30))
+        if not (1 <= page <= 2**31 - 1 and 1 <= page_size <= 200 and 1 <= days <= 365):
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": {"message": "页码、每页条数或日期范围无效"}}), 400
     result = get_state().request_store.query(
-        page=int(args.get("page", 1)),
-        page_size=int(args.get("page_size", 50)),
+        page=page,
+        page_size=page_size,
         proxy_key_id=args.get("proxy_key_id") or None,
         upstream_id=args.get("upstream_id") or None,
         model=args.get("model") or None,
         status_group=args.get("status_group") or None,
-        days=int(args.get("days", 30)),
+        days=days,
     )
     return jsonify(result)
 
@@ -226,7 +234,12 @@ def get_requests():
 @admin_bp.get("/api/stats")
 @require_admin
 def get_stats():
-    days = int(request.args.get("days", 7))
+    try:
+        days = int(request.args.get("days", 7))
+        if not 1 <= days <= 365:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": {"message": "日期范围必须在 1 到 365 天之间"}}), 400
     return jsonify(get_state().request_store.build_summary(days=days))
 
 

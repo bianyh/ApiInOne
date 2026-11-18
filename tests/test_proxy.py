@@ -317,10 +317,9 @@ def test_streaming_proxy_decodes_compressed_sse(client, app, upstream_factory, m
             stream=httpx.ByteStream(gzip.compress(event)),
         )
 
-    upstream_client = httpx.Client
-    monkeypatch.setattr(
-        "relay.proxy.httpx.Client", lambda **kwargs: upstream_client(transport=httpx.MockTransport(respond), **kwargs)
-    )
+    state = app.extensions["relay_state"]
+    state.upstream_client.close()
+    monkeypatch.setattr(state, "upstream_client", httpx.Client(transport=httpx.MockTransport(respond)))
     response = client.post(
         "/v1/responses",
         json={"model": "gpt-4.1", "input": "hello", "stream": True},
@@ -329,6 +328,63 @@ def test_streaming_proxy_decodes_compressed_sse(client, app, upstream_factory, m
     assert response.get_data() == event
     assert "Content-Encoding" not in response.headers
     assert app.extensions["relay_state"].object_store.get("resp_compressed")["upstream_id"] == "compressed_id"
+    state.upstream_client.close()
+
+
+def test_large_download_streams_without_reading_ahead(client, app, upstream_factory):
+    upstream = upstream_factory("downloads", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    state = app.extensions["relay_state"]
+    state.object_store.upsert("file_large", "downloads_id", "file")
+    consumed = []
+
+    class Download(httpx.SyncByteStream):
+        def __iter__(self):
+            for chunk in (b"first", b"second", b"third"):
+                consumed.append(chunk)
+                yield chunk
+
+    state.upstream_client.close()
+    state.upstream_client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=Download(), headers={"Content-Type": "application/octet-stream"})
+    ))
+    response = client.get("/v1/files/file_large/content", headers={"Authorization": f"Bearer {proxy_key}"})
+    assert consumed == [b"first"]
+    assert response.get_data() == b"firstsecondthird"
+
+
+def test_relay_rejects_oversized_requests(client, app, upstream_factory):
+    upstream = upstream_factory("limits", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    app.config["MAX_CONTENT_LENGTH"] = 64
+    response = client.post(
+        "/v1/responses",
+        json={"model": "gpt-4.1", "input": "x" * 100},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.status_code == 413
+    assert response.get_json()["error"]["type"] == "request_too_large"
+    assert upstream.responses_calls == 0
+
+
+def test_stream_error_is_reported_in_request_logs(client, app, upstream_factory):
+    upstream = upstream_factory("stream-error", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    state = app.extensions["relay_state"]
+    state.upstream_client.close()
+    event = b'data: {"type":"response.failed","response":null}\n\n'
+    state.upstream_client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=event, headers={"Content-Type": "text/event-stream"})
+    ))
+    response = client.post(
+        "/v1/responses",
+        json={"model": "gpt-4.1", "input": "hello", "stream": True},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.get_data() == event
+    record = state.request_store.query()["items"][0]
+    assert record["status_code"] == 502
+    assert record["upstream_error"] == "Upstream sent a stream error event"
 
 
 def test_multipart_file_upload_and_index_lookup(client, app, upstream_factory):

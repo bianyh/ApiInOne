@@ -5,11 +5,11 @@ import logging
 import re
 import sqlite3
 import threading
-from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 
@@ -24,75 +24,92 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat()
 
 
+@contextmanager
+def _sqlite_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    with closing(sqlite3.connect(path, timeout=10)) as connection, connection:
+        connection.row_factory = sqlite3.Row
+        yield connection
+
+
 class RequestLogStore:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
+        self.path = self.data_dir / "requests.sqlite3"
+        with _sqlite_connection(self.path) as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
+                connection.execute(
+                    """
+                    CREATE TABLE requests (
+                        id INTEGER PRIMARY KEY,
+                        log_day TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        proxy_key_id TEXT,
+                        upstream_id TEXT,
+                        model TEXT,
+                        proxy_key_name TEXT,
+                        upstream_name TEXT,
+                        status_code INTEGER NOT NULL,
+                        total_tokens INTEGER NOT NULL,
+                        duration_ms REAL NOT NULL,
+                        ttfb_ms REAL,
+                        payload TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.executemany(self._insert, self._legacy_rows())
+                connection.execute("CREATE INDEX requests_day ON requests(log_day)")
+                connection.execute("PRAGMA user_version = 1")
 
-    def _log_path_for(self, dt: datetime) -> Path:
-        return self.data_dir / f"requests-{dt.strftime('%Y-%m-%d')}.jsonl"
+    _insert = """
+        INSERT INTO requests (
+            log_day, created_at, proxy_key_id, upstream_id, model, proxy_key_name,
+            upstream_name, status_code, total_tokens, duration_ms, ttfb_ms, payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
 
-    def _metrics_path_for(self, dt: datetime) -> Path:
-        return self.data_dir / f"metrics-{dt.strftime('%Y-%m-%d')}.json"
+    @staticmethod
+    def _row(day: str, record: dict[str, Any], payload: str) -> tuple:
+        return (
+            day, record.get("created_at") or "", record.get("proxy_key_id"),
+            record.get("upstream_id"), record.get("model"), record.get("proxy_key_name"),
+            record.get("upstream_name"), int(record.get("status_code") or 0),
+            int(record.get("total_tokens") or 0), float(record.get("duration_ms") or 0),
+            record.get("ttfb_ms"), payload,
+        )
+
+    def _legacy_rows(self) -> Iterator[tuple]:
+        for path in sorted(self.data_dir.glob("requests-????-??-??.jsonl"), reverse=True):
+            day = path.stem.removeprefix("requests-")
+            skipped = 0
+            with path.open("rb") as handle:
+                for raw_line in handle:
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        line = raw_line.decode("utf-8")
+                        record = json.loads(line)
+                        if not isinstance(record, dict):
+                            raise ValueError("expected a log record")
+                        row = self._row(day, record, line)
+                    except (TypeError, ValueError):
+                        skipped += 1
+                        continue
+                    yield row
+            if skipped:
+                logger.warning("Skipped %d damaged request log entries in %s", skipped, path)
 
     def append(self, record: dict[str, Any]) -> None:
-        now = _utc_now()
-        line = json.dumps(record, ensure_ascii=False)
-        with self._lock:
-            with self._log_path_for(now).open("a", encoding="utf-8") as handle:
-                handle.write(f"{line}\n")
-            self._append_metrics(now, record)
+        day = _utc_now().date().isoformat()
+        with _sqlite_connection(self.path) as connection:
+            connection.execute(self._insert, self._row(day, record, json.dumps(record, ensure_ascii=False)))
 
-    def _append_metrics(self, dt: datetime, record: dict[str, Any]) -> None:
-        path = self._metrics_path_for(dt)
-        if path.exists():
-            metrics = json.loads(path.read_text(encoding="utf-8"))
-        else:
-            metrics = {
-                "date": dt.strftime("%Y-%m-%d"),
-                "total_requests": 0,
-                "total_tokens": 0,
-                "success_requests": 0,
-                "error_requests": 0,
-                "by_model": {},
-                "by_upstream": {},
-                "by_proxy_key": {},
-                "by_status": {},
-            }
-
-        metrics["total_requests"] += 1
-        metrics["total_tokens"] += int(record.get("total_tokens") or 0)
-        if int(record.get("status_code") or 0) < 400:
-            metrics["success_requests"] += 1
-        else:
-            metrics["error_requests"] += 1
-
-        for field, key in (
-            ("by_model", record.get("model") or "unknown"),
-            ("by_upstream", record.get("upstream_name") or "unknown"),
-            ("by_proxy_key", record.get("proxy_key_name") or "unknown"),
-            ("by_status", str(record.get("status_code") or "unknown")),
-        ):
-            metrics[field][key] = int(metrics[field].get(key, 0)) + 1
-
-        path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def _iter_records(self, days: int = 30) -> list[dict[str, Any]]:
-        now = _utc_now()
-        records: list[dict[str, Any]] = []
-        with self._lock:
-            for offset in range(days):
-                dt = now - timedelta(days=offset)
-                path = self._log_path_for(dt)
-                if not path.exists():
-                    continue
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    records.append(json.loads(line))
-        records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
-        return records
+    @staticmethod
+    def _date_window(days: int) -> tuple[str, str]:
+        today = _utc_now().date()
+        return (today - timedelta(days=days - 1)).isoformat(), today.isoformat()
 
     def query(
         self,
@@ -104,87 +121,79 @@ class RequestLogStore:
         status_group: str | None = None,
         days: int = 30,
     ) -> dict[str, Any]:
-        records = self._iter_records(days=days)
-        filtered = []
-        for item in records:
-            if proxy_key_id and item.get("proxy_key_id") != proxy_key_id:
-                continue
-            if upstream_id and item.get("upstream_id") != upstream_id:
-                continue
-            if model and item.get("model") != model:
-                continue
-            if status_group == "success" and int(item.get("status_code") or 0) >= 400:
-                continue
-            if status_group == "error" and int(item.get("status_code") or 0) < 400:
-                continue
-            filtered.append(item)
-
-        total = len(filtered)
-        start = max(page - 1, 0) * page_size
-        end = start + page_size
-        return {"items": filtered[start:end], "total": total}
+        clauses = ["log_day BETWEEN ? AND ?"]
+        parameters = list(self._date_window(days))
+        for column, value in (("proxy_key_id", proxy_key_id), ("upstream_id", upstream_id), ("model", model)):
+            if value:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        if status_group in {"success", "error"}:
+            clauses.append("status_code < 400" if status_group == "success" else "status_code >= 400")
+        where = " AND ".join(clauses)
+        with _sqlite_connection(self.path) as connection:
+            connection.execute("BEGIN")
+            total = connection.execute(f"SELECT count(*) FROM requests WHERE {where}", parameters).fetchone()[0]
+            rows = connection.execute(
+                f"""SELECT payload FROM requests WHERE {where}
+                    ORDER BY created_at DESC, id LIMIT ? OFFSET ?""",
+                [*parameters, page_size, max(page - 1, 0) * page_size],
+            )
+            return {"items": [json.loads(row["payload"]) for row in rows], "total": total}
 
     def build_summary(self, days: int = 7) -> dict[str, Any]:
-        records = self._iter_records(days=days)
-        total_requests = len(records)
-        success = sum(1 for item in records if int(item.get("status_code") or 0) < 400)
-        error = total_requests - success
-        total_tokens = sum(int(item.get("total_tokens") or 0) for item in records)
-        avg_latency_ms = round(
-            sum(float(item.get("duration_ms") or 0) for item in records) / total_requests,
-            2,
-        ) if total_requests else 0
-        avg_ttfb_ms = round(
-            sum(float(item.get("ttfb_ms") or 0) for item in records if item.get("ttfb_ms") is not None)
-            / max(sum(1 for item in records if item.get("ttfb_ms") is not None), 1),
-            2,
-        ) if total_requests else 0
-
-        by_hour: dict[str, int] = defaultdict(int)
-        latency_by_upstream: dict[str, list[float]] = defaultdict(list)
-        by_model: Counter[str] = Counter()
-        by_upstream: Counter[str] = Counter()
-        by_proxy_key: Counter[str] = Counter()
-        by_status: Counter[str] = Counter()
-
-        for item in records:
-            created_at = item.get("created_at")
-            if created_at:
-                by_hour[created_at[:13] + ":00"] += 1
-            by_model[item.get("model") or "unknown"] += 1
-            by_upstream[item.get("upstream_name") or "unknown"] += 1
-            by_proxy_key[item.get("proxy_key_name") or "unknown"] += 1
-            by_status[str(item.get("status_code") or "unknown")] += 1
-            if item.get("upstream_name"):
-                latency_by_upstream[item["upstream_name"]].append(float(item.get("ttfb_ms") or 0))
-
-        latency_summary = {
-            name: round(sum(values) / len(values), 2) if values else 0
-            for name, values in latency_by_upstream.items()
-        }
-
-        return {
-            "summary": {
-                "total_requests": total_requests,
-                "success_requests": success,
-                "error_requests": error,
-                "total_tokens": total_tokens,
-                "avg_latency_ms": avg_latency_ms,
-                "avg_ttfb_ms": avg_ttfb_ms,
-            },
-            "timeseries": [
-                {"time": key, "count": by_hour[key]}
-                for key in sorted(by_hour.keys())
-            ],
-            "top_models": [{"name": key, "value": value} for key, value in by_model.most_common(8)],
-            "top_upstreams": [{"name": key, "value": value} for key, value in by_upstream.most_common(8)],
-            "top_proxy_keys": [{"name": key, "value": value} for key, value in by_proxy_key.most_common(8)],
-            "status_breakdown": [{"name": key, "value": value} for key, value in by_status.items()],
-            "latency_by_upstream": [
-                {"name": key, "value": value}
-                for key, value in sorted(latency_summary.items(), key=lambda item: item[0])
-            ],
-        }
+        window = self._date_window(days)
+        with _sqlite_connection(self.path) as connection:
+            connection.execute("BEGIN")
+            summary = dict(connection.execute(
+                """
+                SELECT count(*) AS total_requests,
+                       count(CASE WHEN status_code < 400 THEN 1 END) AS success_requests,
+                       count(CASE WHEN status_code >= 400 THEN 1 END) AS error_requests,
+                       coalesce(sum(total_tokens), 0) AS total_tokens,
+                       coalesce(round(avg(duration_ms), 2), 0) AS avg_latency_ms,
+                       coalesce(round(avg(ttfb_ms), 2), 0) AS avg_ttfb_ms
+                FROM requests WHERE log_day BETWEEN ? AND ?
+                """,
+                window,
+            ).fetchone())
+            series = connection.execute(
+                """
+                SELECT substr(created_at, 1, 13) || ':00' AS time, count(*) AS count
+                FROM requests WHERE log_day BETWEEN ? AND ? AND created_at <> ''
+                GROUP BY time ORDER BY time
+                """,
+                window,
+            )
+            latency = connection.execute(
+                """
+                SELECT upstream_name AS name, round(avg(ttfb_ms), 2) AS value
+                FROM requests WHERE log_day BETWEEN ? AND ? AND upstream_name <> '' AND ttfb_ms IS NOT NULL
+                GROUP BY name ORDER BY name
+                """,
+                window,
+            )
+            result = {
+                "summary": summary,
+                "timeseries": [dict(row) for row in series],
+                "latency_by_upstream": [dict(row) for row in latency],
+            }
+            for name, column in (
+                ("top_models", "model"),
+                ("top_upstreams", "upstream_name"),
+                ("top_proxy_keys", "proxy_key_name"),
+                ("status_breakdown", "cast(nullif(status_code, 0) as text)"),
+            ):
+                limit = "" if name == "status_breakdown" else "LIMIT 8"
+                rows = connection.execute(
+                    f"""
+                    SELECT coalesce(nullif({column}, ''), 'unknown') AS name, count(*) AS value
+                    FROM requests WHERE log_day BETWEEN ? AND ?
+                    GROUP BY name ORDER BY value DESC, name {limit}
+                    """,
+                    window,
+                )
+                result[name] = [dict(row) for row in rows]
+            return result
 
 
 class ObjectIndexStore:
@@ -192,7 +201,7 @@ class ObjectIndexStore:
         directory = Path(data_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / "object-index.sqlite3"
-        with self._connect() as connection:
+        with _sqlite_connection(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
                 connection.execute(
@@ -207,12 +216,6 @@ class ObjectIndexStore:
                 )
                 self._import_legacy(connection, directory / "object-index.json")
                 connection.execute("PRAGMA user_version = 1")
-
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self.path, timeout=10)) as connection, connection:
-            connection.row_factory = sqlite3.Row
-            yield connection
 
     @staticmethod
     def _import_legacy(connection: sqlite3.Connection, path: Path) -> None:
@@ -264,7 +267,7 @@ class ObjectIndexStore:
             if object_id
         ]
         if rows:
-            with self._connect() as connection:
+            with _sqlite_connection(self.path) as connection:
                 connection.executemany(
                     """
                     INSERT INTO object_index VALUES (?, ?, ?, ?)
@@ -277,7 +280,7 @@ class ObjectIndexStore:
                 )
 
     def match_from_segments(self, segments: list[str]) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with _sqlite_connection(self.path) as connection:
             for segment in segments:
                 row = connection.execute(
                     "SELECT * FROM object_index WHERE object_id = ?", (segment,)
@@ -318,14 +321,31 @@ class HealthStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.data_dir / "health.json"
         self._lock = threading.RLock()
-        if not self.path.exists():
-            self.path.write_text("{}", encoding="utf-8")
 
     def _load(self) -> dict[str, Any]:
-        return json.loads(self.path.read_text(encoding="utf-8") or "{}")
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8") or "{}")
+            if not isinstance(payload, dict) or any(not isinstance(item, dict) for item in payload.values()):
+                raise ValueError("expected an object of health records")
+            return payload
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            backup = self.path.with_name(f"health.corrupt-{_utc_now():%Y%m%d%H%M%S%f}.json")
+            self.path.replace(backup)
+            logger.warning("Preserved damaged health records at %s", backup)
+            return {}
 
     def _save(self, payload: dict[str, Any]) -> None:
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path = None
+        try:
+            with NamedTemporaryFile(dir=self.data_dir, mode="w", encoding="utf-8", delete=False) as handle:
+                temp_path = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            temp_path.replace(self.path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def get_all(self) -> dict[str, Any]:
         with self._lock:

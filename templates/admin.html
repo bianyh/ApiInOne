@@ -21,30 +21,14 @@
       <div v-if="!session.authenticated" class="login-shell">
         <div class="login-panel">
           <section class="login-brand">
-            <span class="eyebrow">Private Relay Console</span>
             <h1>{{ pageTitle }}</h1>
-            <p>把多个上游模型入口统一收口到一个地址，并且在同一个后台里完成节点管理、代理 Key 分发、调用统计和健康探测。</p>
-            <div class="login-feature-list">
-              <div class="login-feature">
-                <strong>多上游切换</strong>
-                <span>按顺序故障切换，或按测速优选。</span>
-              </div>
-              <div class="login-feature">
-                <strong>纯后端托管</strong>
-                <span>启动 Flask 服务后，前端即刻可用。</span>
-              </div>
-              <div class="login-feature">
-                <strong>按 Key 统计</strong>
-                <span>查看每个代理 Key 的调用明细和趋势。</span>
-              </div>
-            </div>
+            <p>管理上游节点、代理 Key 和调用记录。</p>
           </section>
 
           <el-card shadow="never" class="login-card">
             <template #header>
               <div class="section-heading">
                 <div>
-                  <span class="eyebrow">Admin Access</span>
                   <h3>登录管理台</h3>
                 </div>
               </div>
@@ -68,42 +52,25 @@
       <div v-else class="app-shell">
         <aside class="sidebar">
           <div class="sidebar-brand">
-            <span class="eyebrow">Relay Control</span>
             <h2>{{ pageTitle }}</h2>
             <p>{{ routeModeLabel(settings.route_mode) }}</p>
           </div>
 
-          <div class="sidebar-summary">
-            <div class="summary-chip">
-              <span>已启用节点</span>
-              <strong>{{ enabledUpstreamCount }}</strong>
-            </div>
-            <div class="summary-chip">
-              <span>代理 Key</span>
-              <strong>{{ proxyKeys.length }}</strong>
-            </div>
-            <div class="summary-chip">
-              <span>最近 {{ statsDays }} 天</span>
-              <strong>{{ formatNumber(stats.summary.total_requests) }}</strong>
-            </div>
-          </div>
-
-          <nav class="nav-list">
+          <nav class="nav-list" aria-label="管理台导航">
             <button
               v-for="item in navItems"
               :key="item.key"
               class="nav-button"
               :class="{ active: activeTab === item.key }"
+              :aria-current="activeTab === item.key ? 'page' : null"
               @click="handleTabChange(item.key)"
             >
               <span>{{ item.label }}</span>
-              <small>{{ item.hint }}</small>
             </button>
           </nav>
 
           <div class="sidebar-footer">
             <div class="sidebar-user">
-              <span>当前管理员</span>
               <strong>{{ session.username }}</strong>
             </div>
             <el-button class="logout-button" plain @click="logout">退出登录</el-button>
@@ -113,79 +80,74 @@
         <main class="workspace">
           <header class="workspace-header">
             <div class="workspace-title">
-              <span class="eyebrow">Workspace</span>
               <h1>{{ tabTitle }}</h1>
-              <p>{{ tabDescription }}</p>
-              <div class="header-pills">
-                <span class="header-pill">{{ routeModeLabel(settings.route_mode) }}</span>
-                <span class="header-pill">健康节点 {{ healthyUpstreamCount }}</span>
-                <span class="header-pill">识别模型 {{ uniqueModelCount }}</span>
-              </div>
+              <p v-if="activeTab === 'overview'">
+                {{ enabledUpstreamCount }} 个节点已启用 · {{ healthyUpstreamCount }} 个通过探活 · {{ uniqueModelCount }} 个可选模型
+              </p>
+              <p v-else>{{ tabDescription }}</p>
             </div>
             <div class="workspace-actions">
-              <el-select v-model="statsDays" @change="refreshStats">
-                <el-option :value="1" label="近1天"></el-option>
-                <el-option :value="7" label="近7天"></el-option>
-                <el-option :value="30" label="近30天"></el-option>
+              <el-select v-if="activeTab === 'overview'" v-model="statsDays" aria-label="统计范围" @change="refreshStats">
+                <el-option :value="1" label="今日（UTC）"></el-option>
+                <el-option :value="7" label="近 7 天"></el-option>
+                <el-option :value="30" label="近 30 天"></el-option>
               </el-select>
               <el-button type="primary" @click="refreshAll" :loading="loading.refresh">刷新数据</el-button>
             </div>
           </header>
+          <el-alert
+            v-if="refreshError"
+            class="workspace-alert"
+            :title="refreshError"
+            type="error"
+            show-icon
+            @close="refreshError = ''"
+          ></el-alert>
 
-          <section v-show="activeTab === 'overview'" class="stack-layout">
-            <div class="hero-card">
-              <div class="hero-main">
-                <span class="eyebrow">Setup Guide</span>
-                <h3>最快的使用路径</h3>
-                <p>先添加上游节点，可按需探查模型，再创建代理 Key，最后把你其他机器的 `base_url` 指向这个中转站。</p>
-                <div class="hero-actions">
-                  <el-button type="primary" @click="handleTabChange('upstreams')">先添加节点</el-button>
-                  <el-button @click="handleTabChange('keys')">再创建代理 Key</el-button>
-                </div>
+          <section v-show="activeTab === 'overview'" class="stack-layout" v-loading="loading.stats && !lastRefreshed">
+            <div class="overview-connection">
+              <div>
+                <span>API Base URL</span>
+                <code>{{ relayBaseUrl }}</code>
               </div>
-              <div class="hero-steps">
-                <div class="step-card" :class="{ complete: upstreams.length > 0 }">
-                  <span>01</span>
-                  <strong>添加上游</strong>
-                  <small>{{ upstreams.length > 0 ? '已配置节点' : '填写 Base URL 和 API Key' }}</small>
-                </div>
-                <div class="step-card" :class="{ complete: proxyKeys.length > 0 }">
-                  <span>02</span>
-                  <strong>创建代理 Key</strong>
-                  <small>{{ proxyKeys.length > 0 ? '已可供客户端接入' : '生成给客户端使用的 Bearer Key' }}</small>
-                </div>
-                <div class="step-card" :class="{ complete: stats.summary.total_requests > 0 }">
-                  <span>03</span>
-                  <strong>开始转发</strong>
-                  <small>{{ stats.summary.total_requests > 0 ? '已经有调用流量' : '把客户端 base_url 指向 /v1' }}</small>
-                </div>
+              <el-button @click="copyText(relayBaseUrl, 'Base URL 已复制')">复制地址</el-button>
+            </div>
+
+            <div v-if="needsSetup && !loading.refresh" class="overview-connection">
+              <div>
+                <strong>开始接入</strong>
+                <p>配置一个上游，创建代理 Key，再把上面的地址填入客户端。</p>
+              </div>
+              <div class="card-inline-actions">
+                <el-button v-if="!enabledUpstreamCount" @click="handleTabChange('upstreams')">配置节点</el-button>
+                <el-button v-if="!proxyKeys.some((item) => item.enabled)" @click="handleTabChange('keys')">管理 Key</el-button>
               </div>
             </div>
 
             <div class="metric-grid">
               <div class="metric-card strong">
-                <span>调用总数</span>
+                <span>请求数</span>
                 <strong>{{ formatNumber(stats.summary.total_requests) }}</strong>
-                <small>成功 {{ formatNumber(stats.summary.success_requests) }} / 失败 {{ formatNumber(stats.summary.error_requests) }}</small>
+                <small>平均总耗时 {{ formatLatency(stats.summary.avg_latency_ms) }}</small>
+              </div>
+              <div class="metric-card">
+                <span>成功率</span>
+                <strong>{{ successRate }}</strong>
+                <small>{{ formatNumber(stats.summary.error_requests) }} 次失败</small>
+              </div>
+              <div class="metric-card">
+                <span>平均首字节</span>
+                <strong>{{ stats.summary.total_requests ? formatLatency(stats.summary.avg_ttfb_ms) : '—' }}</strong>
+                <small>从发起上游请求到收到首字节</small>
               </div>
               <div class="metric-card">
                 <span>总 Tokens</span>
                 <strong>{{ formatNumber(stats.summary.total_tokens) }}</strong>
-                <small>按最近 {{ statsDays }} 天聚合</small>
-              </div>
-              <div class="metric-card">
-                <span>平均总耗时</span>
-                <strong>{{ formatLatency(stats.summary.avg_latency_ms) }}</strong>
-                <small>完整响应耗时</small>
-              </div>
-              <div class="metric-card">
-                <span>平均首字耗时</span>
-                <strong>{{ formatLatency(stats.summary.avg_ttfb_ms) }}</strong>
-                <small>首字节到达时间</small>
+                <small v-if="lastRefreshed">更新于 {{ formatDateTime(lastRefreshed) }}</small>
               </div>
             </div>
 
-            <div class="chart-grid">
+            <div v-show="stats.summary.total_requests > 0" class="chart-grid">
               <el-card shadow="never" class="glass-card">
                 <template #header><span>请求趋势</span></template>
                 <div id="requests-chart" class="chart"></div>
@@ -204,13 +166,9 @@
               </el-card>
             </div>
 
-            <el-card shadow="never" class="glass-card">
-              <template #header><span>客户端接入示例</span></template>
-              <div class="code-block">
-                <code>base_url = "http://你的服务器IP:8000/v1"</code>
-                <code>api_key = "管理台生成的 sk-relay-..."</code>
-              </div>
-            </el-card>
+            <div v-if="!stats.summary.total_requests && !loading.stats" class="empty-state">
+              <p>所选范围内没有调用记录。</p>
+            </div>
           </section>
 
           <section v-show="activeTab === 'upstreams'" class="stack-layout">
@@ -422,6 +380,7 @@
               >
                 <template #default>
                   <code>{{ newlyCreatedKey }}</code>
+                  <el-button size="small" @click="copyText(newlyCreatedKey, '代理 Key 已复制')">复制 Key</el-button>
                 </template>
               </el-alert>
             </el-card>
@@ -446,7 +405,7 @@
                     <small>{{ item.key_prefix }}</small>
                   </div>
                   <div class="key-meta">
-                    <span>创建于 {{ formatDateTime(item.created_at) }}</span>
+                    <span>{{ item.last_used_at ? '最后使用 ' + formatDateTime(item.last_used_at) : '尚无调用记录' }}</span>
                     <el-switch v-model="item.enabled" @change="toggleProxyKey(item)"></el-switch>
                   </div>
                 </div>
@@ -455,50 +414,50 @@
           </section>
 
           <section v-show="activeTab === 'requests'" class="stack-layout">
-            <div class="metric-grid compact">
-              <div class="mini-metric">
-                <span>成功请求</span>
-                <strong>{{ formatNumber(stats.summary.success_requests) }}</strong>
-              </div>
-              <div class="mini-metric">
-                <span>失败请求</span>
-                <strong>{{ formatNumber(stats.summary.error_requests) }}</strong>
-              </div>
-              <div class="mini-metric">
-                <span>已启用节点</span>
-                <strong>{{ enabledUpstreamCount }}</strong>
-              </div>
-              <div class="mini-metric">
-                <span>代理 Key 数</span>
-                <strong>{{ proxyKeys.length }}</strong>
-              </div>
-            </div>
-
             <el-card shadow="never" class="glass-card">
               <template #header>
                 <div class="section-heading">
                   <div>
-                    <span class="eyebrow">Request Logs</span>
-                    <h3>调用明细</h3>
+                    <h3>请求记录</h3>
+                    <small>{{ formatNumber(requests.total) }} 条记录</small>
                   </div>
                   <div class="filter-bar">
-                    <el-select v-model="requestFilters.proxy_key_id" clearable placeholder="按 Key 筛选" @change="loadRequests">
+                    <el-select v-model="requestFilters.proxy_key_id" clearable placeholder="按 Key 筛选" @change="applyRequestFilters">
                       <el-option v-for="item in proxyKeys" :key="item.id" :label="item.name" :value="item.id"></el-option>
                     </el-select>
-                    <el-select v-model="requestFilters.upstream_id" clearable placeholder="按节点筛选" @change="loadRequests">
+                    <el-select v-model="requestFilters.upstream_id" clearable placeholder="按节点筛选" @change="applyRequestFilters">
                       <el-option v-for="item in upstreams" :key="item.id" :label="item.name" :value="item.id"></el-option>
                     </el-select>
-                    <el-select v-model="requestFilters.status_group" clearable placeholder="状态" @change="loadRequests">
+                    <el-select v-model="requestFilters.status_group" clearable placeholder="状态" @change="applyRequestFilters">
                       <el-option label="成功" value="success"></el-option>
                       <el-option label="失败" value="error"></el-option>
+                    </el-select>
+                    <el-select
+                      v-model="requestFilters.model"
+                      filterable allow-create default-first-option clearable
+                      placeholder="模型名" @change="applyRequestFilters"
+                    >
+                      <el-option v-for="model in modelMappingModelOptions" :key="model" :label="model" :value="model"></el-option>
+                    </el-select>
+                    <el-select v-model="requestFilters.days" aria-label="记录范围" @change="applyRequestFilters">
+                      <el-option :value="1" label="今日（UTC）"></el-option>
+                      <el-option :value="7" label="近 7 天"></el-option>
+                      <el-option :value="30" label="近 30 天"></el-option>
                     </el-select>
                   </div>
                 </div>
               </template>
 
-              <el-table :data="requests.items" stripe height="620">
+              <el-table v-loading="loading.requests" :data="requests.items" stripe max-height="600" empty-text="暂无匹配的记录">
                 <el-table-column prop="created_at" label="创建时间" min-width="180">
                   <template #default="scope">{{ formatDateTime(scope.row.created_at) }}</template>
+                </el-table-column>
+                <el-table-column prop="status_code" label="状态" width="86">
+                  <template #default="scope">
+                    <el-tag size="small" :type="scope.row.status_code < 400 ? 'success' : 'danger'">
+                      {{ scope.row.status_code }}
+                    </el-tag>
+                  </template>
                 </el-table-column>
                 <el-table-column prop="proxy_key_name" label="Key" min-width="120"></el-table-column>
                 <el-table-column prop="upstream_name" label="节点" min-width="120"></el-table-column>
@@ -517,17 +476,14 @@
                 <el-table-column prop="cache_ratio" label="缓存比率" min-width="100">
                   <template #default="scope">{{ formatPercent(scope.row.cache_ratio) }}</template>
                 </el-table-column>
-                <el-table-column prop="fast" label="Fast" min-width="80">
-                  <template #default="scope">
-                    <el-tag :type="scope.row.fast ? 'success' : 'info'">{{ scope.row.fast ? 'Yes' : 'No' }}</el-tag>
-                  </template>
+                <el-table-column prop="upstream_error" label="失败原因" min-width="190" show-overflow-tooltip>
+                  <template #default="scope">{{ scope.row.upstream_error || '—' }}</template>
                 </el-table-column>
-                <el-table-column prop="million_units" label="1M" min-width="80"></el-table-column>
-                <el-table-column prop="status_code" label="状态" min-width="80"></el-table-column>
               </el-table>
 
               <div class="pagination-row">
                 <el-pagination
+                  :pager-count="5"
                   background
                   layout="prev, pager, next, sizes, total"
                   :current-page="requestFilters.page"

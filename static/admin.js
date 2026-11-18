@@ -1,7 +1,14 @@
 (function () {
-  const { createApp, nextTick } = Vue;
+  const { createApp, markRaw, nextTick } = Vue;
   const message = ElementPlus.ElMessage;
   const messageBox = ElementPlus.ElMessageBox;
+  const fullTime = new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+  const chartTime = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
 
   createApp({
     data() {
@@ -11,9 +18,13 @@
         session: { authenticated: false, username: "", csrf_token: "" },
         loginForm: { username: "admin", password: "" },
         loginError: "",
+        refreshError: "",
+        lastRefreshed: "",
         loading: {
           session: false,
           refresh: false,
+          stats: false,
+          requests: false,
           keys: false,
           health: false,
           settings: false,
@@ -40,7 +51,11 @@
           proxy_key_id: "",
           upstream_id: "",
           status_group: "",
+          model: "",
+          days: 30,
         },
+        requestSequence: 0,
+        statsSequence: 0,
         statsDays: 7,
         stats: {
           summary: {
@@ -94,15 +109,25 @@
       enabledUpstreamCount() {
         return this.upstreams.filter((item) => item.enabled).length;
       },
+      needsSetup() {
+        return !this.enabledUpstreamCount || !this.proxyKeys.some((item) => item.enabled);
+      },
+      relayBaseUrl() {
+        return new URL("/v1", window.location.origin).href;
+      },
+      successRate() {
+        const { total_requests, success_requests } = this.stats.summary;
+        return total_requests ? (100 * success_requests / total_requests).toFixed(1) + "%" : "—";
+      },
       healthyUpstreamCount() {
         return this.healthItems.filter(
-          (item) => item.health && item.health.last_probe_success === true && !item.health.timeout_failover_active,
+          (item) => item.enabled && item.health && item.health.last_probe_success === true && !item.health.timeout_failover_active,
         ).length;
       },
       uniqueModelCount() {
         const models = new Set();
-        this.upstreams.forEach((item) => {
-          this.parseModelsText(item.allowed_models_text).forEach((model) => models.add(model));
+        this.upstreams.filter((item) => item.enabled).forEach((item) => {
+          this.parseModelsText(item.allowed_models_text).filter((model) => model !== "*").forEach((model) => models.add(model));
         });
         return models.size;
       },
@@ -166,6 +191,7 @@
     },
     beforeUnmount() {
       window.removeEventListener("resize", this.resizeCharts);
+      this.disposeCharts();
     },
     methods: {
       blankUpstream() {
@@ -345,17 +371,7 @@
         if (!date) {
           return value || "-";
         }
-        const formatter = new Intl.DateTimeFormat("zh-CN", {
-          timeZone: "Asia/Shanghai",
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-          hour: "2-digit",
-          minute: "2-digit",
-          second: withSeconds ? "2-digit" : undefined,
-          hour12: false,
-        });
-        return formatter.format(date);
+        return (withSeconds ? fullTime : chartTime).format(date);
       },
       formatChartTime(value) {
         return this.formatDateTime(value, false);
@@ -520,6 +536,8 @@
           await this.api("/admin/api/session", { method: "DELETE" });
         } catch (_error) {
         }
+        this.disposeCharts();
+        this.newlyCreatedKey = "";
         this.session = { authenticated: false, username: "", csrf_token: "" };
       },
       async refreshAll() {
@@ -527,23 +545,33 @@
           return;
         }
         this.loading.refresh = true;
+        this.refreshError = "";
         try {
-          await Promise.all([
+          const tasks = [
             this.loadSettings(),
             this.loadUpstreams(),
             this.loadProxyKeys(),
             this.loadHealth(),
-            this.loadRequests(),
-            this.refreshStats(),
-          ]);
+          ];
+          if (this.activeTab === "overview") tasks.push(this.refreshStats());
+          if (this.activeTab === "requests") tasks.push(this.loadRequests());
+          const results = await Promise.allSettled(tasks);
+          const failed = results.find((result) => result.status === "rejected");
+          if (failed) {
+            this.refreshError = failed.reason.message || "部分数据刷新失败";
+          } else if (!this.refreshError) {
+            this.lastRefreshed = new Date().toISOString();
+          }
         } finally {
           this.loading.refresh = false;
         }
       },
       handleTabChange(tab) {
         this.activeTab = tab;
+        this.refreshError = "";
+        if (tab === "requests") this.loadRequests();
         if (tab === "overview") {
-          nextTick(() => this.renderCharts());
+          this.refreshStats();
         }
       },
       async loadSettings() {
@@ -667,12 +695,28 @@
           message.warning("当前没有可复制的模型列表");
           return;
         }
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(text);
-          message.success("模型列表已复制");
-          return;
+        await this.copyText(text, "模型列表已复制");
+      },
+      async copyText(text, success) {
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const field = document.createElement("textarea");
+            field.value = text;
+            field.className = "clipboard-field";
+            document.body.append(field);
+            try {
+              field.select();
+              if (!document.execCommand("copy")) throw new Error();
+            } finally {
+              field.remove();
+            }
+          }
+          message.success(success);
+        } catch (_error) {
+          message.warning("自动复制失败，请选中文本后复制");
         }
-        message.warning("当前浏览器环境不支持自动复制");
       },
       buildUpstreamPayload(item, index) {
         const allowedModels = this.parseModelsText(item.allowed_models_text);
@@ -798,14 +842,29 @@
         }
       },
       async loadRequests() {
+        const sequence = ++this.requestSequence;
+        this.loading.requests = true;
         const params = new URLSearchParams();
         Object.entries(this.requestFilters).forEach(([key, value]) => {
           if (value !== "" && value !== null && value !== undefined) {
             params.set(key, value);
           }
         });
-        const payload = await this.api(`/admin/api/requests?${params.toString()}`);
-        this.requests = payload;
+        try {
+          const payload = await this.api(`/admin/api/requests?${params.toString()}`);
+          if (sequence === this.requestSequence) {
+            this.requests = payload;
+            this.refreshError = "";
+          }
+        } catch (error) {
+          if (sequence === this.requestSequence) this.refreshError = error.message;
+        } finally {
+          if (sequence === this.requestSequence) this.loading.requests = false;
+        }
+      },
+      applyRequestFilters() {
+        this.requestFilters.page = 1;
+        this.loadRequests();
       },
       handleRequestPage(page) {
         this.requestFilters.page = page;
@@ -817,11 +876,24 @@
         this.loadRequests();
       },
       async refreshStats() {
-        const payload = await this.api(`/admin/api/stats?days=${this.statsDays}`);
-        this.stats = payload;
-        if (this.activeTab === "overview") {
+        const sequence = ++this.statsSequence;
+        this.loading.stats = true;
+        try {
+          const payload = await this.api(`/admin/api/stats?days=${this.statsDays}`);
+          if (sequence === this.statsSequence) {
+            this.stats = payload;
+            this.refreshError = "";
+            this.lastRefreshed = new Date().toISOString();
+          }
+        } catch (error) {
+          if (sequence === this.statsSequence) this.refreshError = error.message;
+        } finally {
+          if (sequence === this.statsSequence) this.loading.stats = false;
+        }
+        if (sequence === this.statsSequence && this.activeTab === "overview") {
           await nextTick();
           this.renderCharts();
+          this.resizeCharts();
         }
       },
       async loadHealth() {
@@ -888,11 +960,11 @@
       },
       getChart(id) {
         const element = document.getElementById(id);
-        if (!element) {
+        if (!element || !window.echarts) {
           return null;
         }
         if (!this.charts[id]) {
-          this.charts[id] = echarts.init(element);
+          this.charts[id] = markRaw(window.echarts.init(element));
         }
         return this.charts[id];
       },
@@ -910,6 +982,7 @@
               type: "category",
               data: this.stats.timeseries.map((item) => this.formatChartTime(item.time)),
               axisLine: { lineStyle: { color: "#bfd0c2" } },
+              axisLabel: { hideOverlap: true, color: "#52625a", showMinLabel: false, showMaxLabel: false },
             },
             yAxis: {
               type: "value",
@@ -921,7 +994,7 @@
               smooth: true,
               areaStyle: { color: "rgba(15,140,96,0.16)" },
               lineStyle: { color: "#0f8c60", width: 3 },
-              symbol: "circle",
+              showSymbol: false,
             }],
           });
         }
@@ -933,7 +1006,10 @@
               type: "pie",
               radius: ["50%", "74%"],
               itemStyle: { borderRadius: 12 },
-              data: this.stats.status_breakdown,
+              data: this.stats.status_breakdown.map((item) => ({
+                ...item,
+                itemStyle: { color: Number(item.name) < 400 ? "#16815c" : "#c35c43" },
+              })),
             }],
           });
         }
@@ -947,6 +1023,7 @@
               type: "category",
               data: this.stats.top_models.map((item) => item.name),
               axisTick: { show: false },
+              axisLabel: { overflow: "truncate", width: 84 },
             },
             series: [{
               type: "bar",
@@ -979,6 +1056,10 @@
             chart.resize();
           }
         });
+      },
+      disposeCharts() {
+        Object.values(this.charts).forEach((chart) => chart.dispose());
+        this.charts = {};
       },
     },
   }).use(ElementPlus).mount("#app");

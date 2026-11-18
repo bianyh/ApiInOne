@@ -187,7 +187,7 @@ class MockUpstreamServer:
             return jsonify(payload)
 
     def start(self) -> "MockUpstreamServer":
-        self._server = make_server("127.0.0.1", 0, self._app)
+        self._server = make_server("127.0.0.1", 0, self._app, threaded=True)
         self.base_url = f"http://127.0.0.1:{self._server.server_port}"
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -222,6 +222,7 @@ def app():
     )
     application.config.update(TESTING=True)
     yield application
+    application.extensions["relay_state"].upstream_client.close()
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
 

@@ -9,7 +9,8 @@ def test_admin_dashboard_renders(client):
     response = client.get("/admin")
     assert response.status_code == 200
     body = response.get_data(as_text=True)
-    assert "Private Relay Console" in body
+    assert "登录管理台" in body
+    assert "复制地址" in body
     assert "自动探查模型" in body
     assert "三步添加节点" in body
     assert "拖拽调整使用顺序" in body

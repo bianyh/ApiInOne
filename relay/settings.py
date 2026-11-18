@@ -8,6 +8,7 @@ APP_NAME = "all-api-in-one"
 DEFAULT_CONFIG_PATH = Path("config.yaml")
 DEFAULT_DATA_DIRNAME = "data"
 SESSION_COOKIE_NAME = "relay_admin_session"
+DEFAULT_MAX_REQUEST_BYTES = 32 * 1024**2
 
 # Admin credentials are kept on the backend. Public repo defaults are placeholders;
 # set environment variables before deploying the service publicly.

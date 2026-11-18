@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 import time
 from collections.abc import Iterator
+from itertools import chain
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
+from flask import Blueprint, Response, current_app, jsonify, request
 
 from relay.auth import resolve_proxy_key
 from relay.routing import build_upstream_url, resolve_bound_upstream, select_candidates
-from relay.storage import ObjectIndexStore, RequestLogStore
+from relay.state import RelayState
+from relay.storage import ObjectIndexStore
 from relay.usage import detect_fast_flag, extract_usage
 from relay.utils import (
     extract_model_from_request,
@@ -23,6 +27,8 @@ from relay.utils import (
 
 
 proxy_bp = Blueprint("proxy", __name__)
+logger = logging.getLogger(__name__)
+_MAX_CAPTURE_BYTES = 4 * 1024**2
 
 
 _SAFE_FORWARD_HEADERS = {
@@ -54,11 +60,13 @@ def _request_body() -> bytes:
 
 def _extract_request_context(path: str) -> dict[str, Any]:
     body = _request_body()
-    parsed = parse_json_bytes(body) if request.mimetype == "application/json" else None
+    parsed = request.get_json(silent=True) if request.mimetype == "application/json" else None
     requested_model = extract_model_from_request(request)
     return {
         "body": body,
         "json": parsed,
+        "path": path,
+        "method": request.method,
         "model": requested_model,
         "requested_model": requested_model,
         "upstream_model": requested_model,
@@ -194,8 +202,8 @@ def _build_log_record(
     total_tokens = usage.get("total_tokens")
     return {
         "created_at": utc_now_iso(),
-        "path": request.path,
-        "method": request.method,
+        "path": ctx["path"],
+        "method": ctx["method"],
         "endpoint_family": ctx["endpoint_family"],
         "model": ctx["requested_model"],
         "requested_model": ctx["requested_model"],
@@ -222,44 +230,73 @@ def _build_log_record(
 
 class _StreamUsageTracker:
     def __init__(self) -> None:
-        self.buffer = b""
+        self.buffer = bytearray()
+        self.skipping_line = False
+        self.created_payload: dict[str, Any] | None = None
         self.last_payload: dict[str, Any] | None = None
+        self.failed = False
+        self.completed = False
 
     def feed(self, chunk: bytes) -> None:
-        self.buffer += chunk
-        while b"\n" in self.buffer:
-            line, self.buffer = self.buffer.split(b"\n", 1)
-            stripped = line.strip()
-            if not stripped.startswith(b"data:"):
-                continue
-            data = stripped[5:].strip()
-            if not data or data == b"[DONE]":
-                continue
-            try:
-                parsed = json.loads(data)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(parsed, dict):
-                self.last_payload = parsed
+        start = 0
+        while start < len(chunk):
+            newline = chunk.find(b"\n", start)
+            end = len(chunk) if newline == -1 else newline
+            if not self.skipping_line:
+                if len(self.buffer) + end - start <= _MAX_CAPTURE_BYTES:
+                    self.buffer.extend(chunk[start:end])
+                else:
+                    self.buffer.clear()
+                    self.skipping_line = True
+            if newline == -1:
+                return
+            if not self.skipping_line:
+                self._parse_line(self.buffer)
+            self.buffer.clear()
+            self.skipping_line = False
+            start = newline + 1
+
+    def _parse_line(self, line: bytearray) -> None:
+        if not line.startswith(b"data:"):
+            return
+        data = line[5:].strip()
+        if not data:
+            return
+        if data == b"[DONE]":
+            self.completed = True
+            return
+        try:
+            parsed = json.loads(data)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        event_type = parsed.get("type")
+        if event_type == "response.created":
+            self.created_payload = parsed
+        if event_type == "response.completed":
+            self.completed = True
+        if event_type in ("response.failed", "error") or isinstance(parsed.get("error"), dict):
+            self.failed = True
+        if self.last_payload is None or "usage" in parsed or "response" in parsed:
+            self.last_payload = parsed
 
 
-def _passive_health(upstream_id: str, status_or_success: int | bool, ttfb_ms: float | None) -> None:
-    if isinstance(status_or_success, bool):
-        success = status_or_success
-    else:
-        success = int(status_or_success) < 400
-    get_state().health_store.record_passive_result(
-        upstream_id,
-        success=success,
-        ttfb_ms=ttfb_ms,
-    )
+def _passive_health(state: RelayState, upstream_id: str, status_code: int, ttfb_ms: float | None) -> None:
+    try:
+        state.health_store.record_passive_result(upstream_id, success=status_code < 400, ttfb_ms=ttfb_ms)
+    except (OSError, ValueError):
+        logger.exception("Failed to update upstream health for %s", upstream_id)
 
 
 def _mark_upstream_failover(upstream: dict[str, Any], exc: Exception, label: str = "Network error") -> None:
-    get_state().health_store.mark_timeout_failover(
-        upstream["id"],
-        f"{label}: {type(exc).__name__}: {str(exc)}"[:240],
-    )
+    try:
+        get_state().health_store.mark_timeout_failover(
+            upstream["id"],
+            f"{label}: {type(exc).__name__}: {str(exc)}"[:240],
+        )
+    except (OSError, ValueError):
+        logger.exception("Failed to update upstream failover state for %s", upstream["id"])
 
 
 def _maybe_mark_upstream_failover(
@@ -272,10 +309,93 @@ def _maybe_mark_upstream_failover(
         _mark_upstream_failover(upstream, exc, label=label)
 
 
-def _log_request(record: dict[str, Any], proxy_key_id: str) -> None:
-    state = get_state()
-    state.request_store.append(record)
-    state.config_store.mark_proxy_key_used(proxy_key_id)
+def _record_result(
+    state: RelayState,
+    proxy_key: dict[str, Any],
+    upstream: dict[str, Any],
+    ctx: dict[str, Any],
+    status_code: int,
+    started: float,
+    ttfb_ms: float | None,
+    payload: dict[str, Any] | None = None,
+    error: str | None = None,
+    indexed_payload: dict[str, Any] | None = None,
+) -> None:
+    duration_ms = (time.perf_counter() - started) * 1000
+    if payload is not None or indexed_payload is not None:
+        try:
+            _index_response_objects(state.object_store, upstream["id"], [indexed_payload, payload])
+        except (OSError, sqlite3.Error):
+            logger.exception("Failed to index response objects for %s", upstream["id"])
+    if status_code != 499:
+        _passive_health(state, upstream["id"], status_code, ttfb_ms)
+    try:
+        state.request_store.append(_build_log_record(
+            proxy_key, upstream, ctx, status_code, duration_ms, ttfb_ms, payload, error
+        ))
+        state.config_store.mark_proxy_key_used(proxy_key["id"])
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        logger.exception("Failed to record request to %s", upstream["id"])
+
+
+def _forward_stream(
+    upstream_response: httpx.Response,
+    chunks: Iterator[bytes],
+    state: RelayState,
+    proxy_key: dict[str, Any],
+    upstream: dict[str, Any],
+    ctx: dict[str, Any],
+    started: float,
+    ttfb_ms: float | None = None,
+    track_sse: bool = False,
+) -> Response:
+    # Keep only log metadata once the upstream has received the request.
+    metadata = {key: value for key, value in ctx.items() if key not in {"body", "json"}}
+    tracker = _StreamUsageTracker() if track_sse else None
+
+    def generate():
+        nonlocal ttfb_ms
+        status = upstream_response.status_code
+        error = None
+        try:
+            for chunk in chunks:
+                if ttfb_ms is None:
+                    ttfb_ms = (time.perf_counter() - started) * 1000
+                if tracker is not None:
+                    tracker.feed(chunk)
+                yield chunk
+            if tracker is not None and tracker.failed and status < 400:
+                status, error = 502, "Upstream sent a stream error event"
+        except GeneratorExit:
+            if tracker is not None and tracker.failed:
+                status, error = 502, "Upstream sent a stream error event"
+            elif tracker is None or not tracker.completed:
+                status, error = 499, "Client disconnected"
+            raise
+        except httpx.HTTPError as exc:
+            status = 504 if isinstance(exc, httpx.TimeoutException) else 502
+            error = f"Upstream stream interrupted: {type(exc).__name__}"
+            raise
+        finally:
+            upstream_response.close()
+            _record_result(
+                state, proxy_key, upstream, metadata, status, started, ttfb_ms,
+                payload=tracker.last_payload if tracker else None,
+                error=error,
+                indexed_payload=tracker.created_payload if tracker else None,
+            )
+
+    response = Response(generate(), status=upstream_response.status_code, headers=_response_headers(upstream_response))
+    response.call_on_close(upstream_response.close)
+    return response
+
+
+def _response_headers(upstream_response: httpx.Response) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in upstream_response.headers.items()
+        if key.lower() not in {"content-length", "transfer-encoding", "content-encoding", "connection", "set-cookie"}
+    }
 
 
 def _request_url(path: str) -> str:
@@ -333,187 +453,69 @@ def relay_request(subpath: str):
         candidates = candidates[:1]
 
     last_error = None
-    query_params = request.query_string.decode("utf-8", errors="ignore")
+    client = state.upstream_client
 
     for index, upstream in enumerate(candidates):
         started = time.perf_counter()
-        tracker = _StreamUsageTracker()
-        ttfb_ms = None
-        response_payload = None
-        client = None
+        upstream_response = None
+        can_fail_over = auto_failover_enabled and index < len(candidates) - 1
         try:
-            target_url = build_upstream_url(upstream["base_url"], incoming_path)
-            if query_params:
-                target_url = f"{target_url}?{query_params}"
+            target_url = build_upstream_url(upstream["base_url"], _request_url(incoming_path))
             request_kwargs = _build_upstream_request_kwargs(upstream["api_key"], ctx)
-
-            client = httpx.Client(
-                timeout=httpx.Timeout(normalize_timeout_seconds(upstream.get("timeout_ms", 120000))),
-                follow_redirects=True,
-            )
             upstream_response = client.send(
                 client.build_request(
                     request.method,
                     target_url,
+                    timeout=httpx.Timeout(normalize_timeout_seconds(upstream.get("timeout_ms", 120000))),
                     **request_kwargs,
                 ),
                 stream=True,
             )
-            content_type = upstream_response.headers.get("content-type", "")
-            is_stream = "text/event-stream" in content_type.lower()
-
-            if upstream_response.status_code >= 500 and auto_failover_enabled and index < len(candidates) - 1:
-                _passive_health(upstream["id"], False, None)
-                if _is_timeout_status(upstream_response.status_code):
-                    _maybe_mark_upstream_failover(
-                        upstream,
-                        RuntimeError(f"HTTP {upstream_response.status_code} upstream timeout response"),
-                        auto_failover_enabled,
-                        label="Timeout",
-                    )
-                last_error = f"upstream {upstream['name']} returned {upstream_response.status_code}"
-                upstream_response.close()
-                client.close()
-                continue
-
-            if is_stream:
-                def generate():
-                    nonlocal ttfb_ms, response_payload
-                    first_chunk_seen = False
-                    try:
-                        for chunk in upstream_response.iter_bytes():
-                            if not first_chunk_seen:
-                                ttfb_ms = round((time.perf_counter() - started) * 1000, 2)
-                                first_chunk_seen = True
-                            tracker.feed(chunk)
-                            yield chunk
-                    finally:
-                        upstream_response.close()
-                        client.close()
-                        duration_ms = round((time.perf_counter() - started) * 1000, 2)
-                        response_payload = tracker.last_payload
-                        if response_payload is not None:
-                            _index_response_objects(state.object_store, upstream["id"], response_payload)
-                        _passive_health(upstream["id"], upstream_response.status_code, ttfb_ms)
-                        record = _build_log_record(
-                            proxy_key=proxy_key,
-                            upstream=upstream,
-                            ctx=ctx,
-                            status_code=upstream_response.status_code,
-                            duration_ms=duration_ms,
-                            ttfb_ms=ttfb_ms,
-                            response_payload=response_payload,
-                        )
-                        _log_request(record, proxy_key["id"])
-
-                response_headers = {
-                    key: value
-                    for key, value in upstream_response.headers.items()
-                    if key.lower() not in {"content-length", "transfer-encoding", "content-encoding", "connection"}
-                }
-                return Response(
-                    stream_with_context(generate()),
-                    status=upstream_response.status_code,
-                    headers=response_headers,
-                )
-
-            response_bytes = upstream_response.read()
-            ttfb_ms = round((time.perf_counter() - started) * 1000, 2)
-            duration_ms = round((time.perf_counter() - started) * 1000, 2)
-            if upstream_response.status_code >= 500 and auto_failover_enabled and index < len(candidates) - 1:
-                _passive_health(upstream["id"], False, None)
-                if _is_timeout_status(upstream_response.status_code):
-                    _maybe_mark_upstream_failover(
-                        upstream,
-                        RuntimeError(f"HTTP {upstream_response.status_code} upstream timeout response"),
-                        auto_failover_enabled,
-                        label="Timeout",
-                    )
-                last_error = f"upstream {upstream['name']} returned {upstream_response.status_code}"
-                upstream_response.close()
-                client.close()
-                continue
-
-            if _is_timeout_status(upstream_response.status_code):
+            status = upstream_response.status_code
+            content_type = upstream_response.headers.get("content-type", "").lower()
+            if _is_timeout_status(status):
                 _maybe_mark_upstream_failover(
-                    upstream,
-                    RuntimeError(f"HTTP {upstream_response.status_code} upstream timeout response"),
-                    auto_failover_enabled,
-                    label="Timeout",
+                    upstream, RuntimeError(f"HTTP {status} upstream timeout response"),
+                    auto_failover_enabled, label="Timeout",
+                )
+            if can_fail_over and (status >= 500 or status in {408, 429}):
+                upstream_response.close()
+                _passive_health(state, upstream["id"], status, None)
+                last_error = f"upstream {upstream['name']} returned {status}"
+                continue
+
+            chunks = upstream_response.iter_bytes()
+            is_sse = "text/event-stream" in content_type
+            # Files can be arbitrarily large. The response body stays in the iterator.
+            if is_sse or (incoming_path.startswith("/v1/files/") and incoming_path.endswith("/content")):
+                return _forward_stream(
+                    upstream_response, chunks, state, proxy_key, upstream, ctx, started, track_sse=is_sse,
                 )
 
-            if "application/json" in content_type.lower():
-                response_payload = parse_json_bytes(response_bytes)
-                if response_payload is not None:
-                    _index_response_objects(state.object_store, upstream["id"], response_payload)
-
-            _passive_health(upstream["id"], upstream_response.status_code, ttfb_ms)
-            record = _build_log_record(
-                proxy_key=proxy_key,
-                upstream=upstream,
-                ctx=ctx,
-                status_code=upstream_response.status_code,
-                duration_ms=duration_ms,
-                ttfb_ms=ttfb_ms,
-                response_payload=response_payload,
-            )
-            _log_request(record, proxy_key["id"])
-
-            response_headers = {
-                key: value
-                for key, value in upstream_response.headers.items()
-                if key.lower() not in {"content-length", "transfer-encoding", "content-encoding", "connection"}
-            }
+            response_bytes = bytearray()
+            ttfb_ms = None
+            for chunk in chunks:
+                if ttfb_ms is None:
+                    ttfb_ms = (time.perf_counter() - started) * 1000
+                if len(response_bytes) + len(chunk) > _MAX_CAPTURE_BYTES:
+                    return _forward_stream(
+                        upstream_response, chain((bytes(response_bytes), chunk), chunks),
+                        state, proxy_key, upstream, ctx, started, ttfb_ms,
+                    )
+                response_bytes.extend(chunk)
             upstream_response.close()
-            client.close()
-            return Response(
-                response_bytes,
-                status=upstream_response.status_code,
-                headers=response_headers,
-            )
-        except httpx.TimeoutException as exc:
-            last_error = str(exc)
-            _maybe_mark_upstream_failover(upstream, exc, auto_failover_enabled, label="Timeout")
-            _passive_health(upstream["id"], False, None)
-            if auto_failover_enabled and index < len(candidates) - 1:
-                if client:
-                    client.close()
-                continue
-            duration_ms = round((time.perf_counter() - started) * 1000, 2)
-            record = _build_log_record(
-                proxy_key=proxy_key,
-                upstream=upstream,
-                ctx=ctx,
-                status_code=599,
-                duration_ms=duration_ms,
-                ttfb_ms=None,
-                response_payload=None,
-                upstream_error=f"Timeout: {last_error}",
-            )
-            _log_request(record, proxy_key["id"])
-            if client:
-                client.close()
+            payload = parse_json_bytes(response_bytes) if "application/json" in content_type else None
+            _record_result(state, proxy_key, upstream, ctx, status, started, ttfb_ms, payload)
+            return Response(bytes(response_bytes), status=status, headers=_response_headers(upstream_response))
         except httpx.HTTPError as exc:
-            last_error = str(exc)
-            _maybe_mark_upstream_failover(upstream, exc, auto_failover_enabled)
-            _passive_health(upstream["id"], False, None)
-            if auto_failover_enabled and index < len(candidates) - 1:
-                if client:
-                    client.close()
+            if upstream_response is not None:
+                upstream_response.close()
+            label = "Timeout" if isinstance(exc, httpx.TimeoutException) else "Network error"
+            last_error = f"{label}: {type(exc).__name__}"
+            _maybe_mark_upstream_failover(upstream, exc, auto_failover_enabled, label=label)
+            if can_fail_over:
+                _passive_health(state, upstream["id"], 599, None)
                 continue
-            duration_ms = round((time.perf_counter() - started) * 1000, 2)
-            record = _build_log_record(
-                proxy_key=proxy_key,
-                upstream=upstream,
-                ctx=ctx,
-                status_code=599,
-                duration_ms=duration_ms,
-                ttfb_ms=None,
-                response_payload=None,
-                upstream_error=last_error,
-            )
-            _log_request(record, proxy_key["id"])
-            if client:
-                client.close()
+            _record_result(state, proxy_key, upstream, ctx, 599, started, None, error=last_error)
 
     return _error(last_error or "All upstreams failed", 502, "api_error")

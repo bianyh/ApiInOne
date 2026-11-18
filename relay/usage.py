@@ -4,9 +4,12 @@ from typing import Any
 
 
 def extract_usage(payload: dict[str, Any] | None) -> dict[str, Any]:
-    usage = payload.get("usage") if isinstance(payload, dict) else None
-    response_usage = payload.get("response", {}).get("usage") if isinstance(payload, dict) else None
-    usage = usage or response_usage or {}
+    payload = payload if isinstance(payload, dict) else {}
+    response = payload.get("response")
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        usage = response.get("usage") if isinstance(response, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
     input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
     output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
     cached_tokens = (

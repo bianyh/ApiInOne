@@ -150,7 +150,6 @@ body {
 .sidebar,
 .glass-card,
 .metric-card,
-.hero-card,
 .health-card,
 .key-card {
   background: var(--panel);
@@ -194,28 +193,11 @@ body {
   line-height: 1.8;
 }
 
-.login-feature-list {
-  margin-top: 34px;
-  display: grid;
-  gap: 14px;
-}
-
-.login-feature {
-  padding: 16px 18px;
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid rgba(17, 33, 24, 0.06);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
-}
-
-.login-feature strong,
-.section-heading h3,
-.hero-main h3 {
+.section-heading h3 {
   display: block;
   margin-bottom: 6px;
 }
 
-.login-feature span,
 .section-heading small,
 .helper-text,
 .workspace-header p,
@@ -242,7 +224,7 @@ body {
   z-index: 1;
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: 224px minmax(0, 1fr);
   gap: 20px;
   padding: 20px;
 }
@@ -251,9 +233,12 @@ body {
   position: sticky;
   top: 20px;
   height: calc(100vh - 40px);
-  overflow: hidden;
-  padding: 24px;
-  border-radius: 30px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px 18px;
+  border-radius: 22px;
   background:
     linear-gradient(180deg, rgba(14, 27, 21, 0.96), rgba(17, 38, 31, 0.96)),
     linear-gradient(135deg, rgba(15, 140, 96, 0.16), transparent);
@@ -275,7 +260,7 @@ body {
 
 .sidebar-brand h2 {
   margin: 0 0 6px;
-  font-size: 28px;
+  font-size: 22px;
   line-height: 1.05;
 }
 
@@ -284,43 +269,22 @@ body {
 }
 
 .sidebar-brand p,
-.summary-chip span,
 .sidebar-user span,
 .nav-button small {
   color: rgba(246, 251, 248, 0.68);
 }
 
-.sidebar-summary,
 .nav-list {
   display: grid;
-  gap: 12px;
-}
-
-.sidebar-summary {
-  margin: 26px 0 24px;
-}
-
-.summary-chip {
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-}
-
-.summary-chip strong {
-  display: block;
-  margin-top: 6px;
-  font-size: 24px;
-  color: #fff;
+  gap: 6px;
 }
 
 .nav-button {
   width: 100%;
   position: relative;
   border: 1px solid transparent;
-  border-radius: 18px;
-  padding: 14px 16px;
+  border-radius: 12px;
+  padding: 12px 14px;
   background: transparent;
   color: #fff;
   text-align: left;
@@ -362,18 +326,14 @@ body {
 }
 
 .sidebar-footer {
-  position: absolute;
-  left: 24px;
-  right: 24px;
-  bottom: 24px;
+  margin-top: auto;
   display: grid;
   gap: 12px;
 }
 
 .sidebar-user {
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.08);
+  padding: 0 6px;
+  overflow-wrap: anywhere;
 }
 
 .sidebar-user strong {
@@ -385,23 +345,7 @@ body {
 .workspace {
   min-width: 0;
   position: relative;
-  padding: 20px;
-  border-radius: 34px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.18));
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.36);
-  backdrop-filter: blur(16px);
-}
-
-.workspace::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background:
-    radial-gradient(circle at top right, rgba(27, 99, 208, 0.08), transparent 34%),
-    radial-gradient(circle at bottom left, rgba(15, 140, 96, 0.08), transparent 30%);
-  pointer-events: none;
+  padding: 12px 4px;
 }
 
 .workspace-header {
@@ -419,34 +363,13 @@ body {
 
 .workspace-header h1 {
   margin: 0 0 8px;
-  font-size: 38px;
+  font-size: 32px;
   line-height: 1.02;
-}
-
-.header-pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.header-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 9px 13px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.58);
-  border: 1px solid rgba(17, 33, 24, 0.08);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
 }
 
 .workspace-actions,
 .section-actions,
 .filter-bar,
-.hero-actions,
 .card-inline-actions,
 .dialog-footer,
 .table-actions,
@@ -460,6 +383,56 @@ body {
 .stack-layout {
   display: grid;
   gap: 18px;
+}
+
+.workspace-alert {
+  margin-bottom: 16px;
+}
+
+.workspace-actions .el-select {
+  width: 140px;
+}
+
+.overview-connection {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel-strong);
+}
+
+.overview-connection span,
+.overview-connection p {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 4px;
+}
+
+.overview-connection code {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.clipboard-field {
+  position: fixed;
+  top: 0;
+  left: -10000px;
+}
+
+.filter-bar {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.filter-bar .el-select {
+  width: 128px;
 }
 
 .guide-grid {
@@ -483,7 +456,6 @@ body {
 }
 
 .guide-card::after,
-.hero-card::after,
 .glass-card::after,
 .metric-card::after,
 .key-card::after,
@@ -531,41 +503,6 @@ body {
   display: block;
   margin-top: 10px;
   font-size: 24px;
-}
-
-.hero-card {
-  position: relative;
-  overflow: hidden;
-  display: grid;
-  grid-template-columns: 1.05fr 0.95fr;
-  gap: 20px;
-  padding: 24px;
-  border-radius: 28px;
-  background:
-    linear-gradient(155deg, rgba(255, 255, 255, 0.92), rgba(232, 245, 237, 0.86)),
-    linear-gradient(135deg, rgba(15, 140, 96, 0.1), rgba(27, 99, 208, 0.05));
-}
-
-.hero-card::before {
-  content: "";
-  position: absolute;
-  top: -56px;
-  right: -24px;
-  width: 180px;
-  height: 180px;
-  border-radius: 999px;
-  background: radial-gradient(circle, rgba(255, 255, 255, 0.4), transparent 70%);
-}
-
-.hero-main p {
-  margin: 0;
-  max-width: 560px;
-  line-height: 1.7;
-}
-
-.hero-steps {
-  display: grid;
-  gap: 12px;
 }
 
 .wizard-steps {
@@ -619,50 +556,13 @@ body {
   background: rgba(255, 255, 255, 0.56);
 }
 
-.step-card {
-  padding: 16px 18px;
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid var(--line);
-}
-
-.step-card span {
-  display: inline-flex;
-  width: 34px;
-  height: 34px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: rgba(17, 33, 24, 0.08);
-  font-weight: 700;
-}
-
-.step-card strong {
-  display: block;
-  margin: 12px 0 6px;
-}
-
-.step-card small {
-  color: var(--muted);
-}
-
-.step-card.complete {
-  background: rgba(15, 140, 96, 0.12);
-  border-color: rgba(15, 140, 96, 0.18);
-}
-
 .metric-grid {
   display: grid;
   gap: 18px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
-.metric-grid.compact {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.metric-card,
-.mini-metric {
+.metric-card {
   position: relative;
   padding: 20px 22px;
   border-radius: 24px;
@@ -672,40 +572,30 @@ body {
   background: var(--panel-strong);
 }
 
-.metric-card strong,
-.mini-metric strong {
+.metric-card strong {
   display: block;
   margin: 16px 0 8px;
   font-size: 34px;
   letter-spacing: -0.04em;
 }
 
-.metric-card span,
-.mini-metric span {
+.metric-card span {
   color: var(--muted);
 }
 
-.metric-card small,
-.mini-metric small {
+.metric-card small {
   color: var(--muted);
 }
 
 .metric-card.strong {
   color: #fff;
-  background:
-    linear-gradient(135deg, rgba(15, 140, 96, 0.92), rgba(27, 99, 208, 0.82));
+  background: #146447;
   box-shadow: 0 24px 50px rgba(15, 140, 96, 0.18);
 }
 
 .metric-card.strong span,
 .metric-card.strong small {
   color: rgba(255, 255, 255, 0.8);
-}
-
-.mini-metric {
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow-soft);
 }
 
 .chart-grid {
@@ -725,14 +615,13 @@ body {
 .glass-card,
 .metric-card,
 .guide-card,
-.hero-card,
 .key-card,
 .health-card {
   animation: riseIn 420ms ease both;
 }
 
 .chart {
-  height: 320px;
+  height: 260px;
 }
 
 .section-heading {
@@ -1046,6 +935,11 @@ body {
   margin-top: 18px;
 }
 
+.pagination-row .el-pagination {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .settings-form {
   max-width: 880px;
 }
@@ -1337,16 +1231,22 @@ code {
   padding: 10px 24px 24px !important;
 }
 
-@media (max-width: 1280px) {
-  .app-shell,
+@media (max-width: 1080px) {
   .login-panel,
   .guide-grid,
-  .hero-card,
   .two-column-layout,
-  .chart-grid,
-  .metric-grid,
   .dialog-grid,
   .health-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 880px) {
+  .app-shell {
     grid-template-columns: 1fr;
   }
 
@@ -1356,8 +1256,18 @@ code {
   }
 
   .sidebar-footer {
-    position: static;
-    margin-top: 18px;
+    margin-top: 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .logout-button {
+    width: auto;
+  }
+
+  .nav-list {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
@@ -1370,8 +1280,6 @@ code {
   .login-brand,
   .sidebar,
   .metric-card,
-  .mini-metric,
-  .hero-card,
   .workspace,
   .workspace-header,
   .glass-card {
@@ -1380,7 +1288,6 @@ code {
 
   .workspace-header,
   .workspace-actions,
-  .header-pills,
   .section-heading,
   .section-actions,
   .model-list-head,
@@ -1394,7 +1301,6 @@ code {
   .probe-status-title,
   .probe-step-item,
   .filter-bar,
-  .hero-actions,
   .card-inline-actions,
   .dialog-footer,
   .switch-row,
@@ -1406,7 +1312,47 @@ code {
 
   .dialog-grid,
   .double-grid,
+  .chart-grid,
   .model-mapping-row {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-header {
+    padding: 4px 0;
+  }
+
+  .workspace-actions,
+  .filter-bar {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .filter-bar {
+    justify-content: flex-start;
+  }
+
+  .overview-connection {
+    flex-wrap: wrap;
+  }
+
+  .overview-connection > div:first-child {
+    flex: 1 1 225px;
+  }
+
+  .metric-card {
+    padding: 14px;
+  }
+
+  .metric-card strong {
+    font-size: 26px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ambient-orb,
+  .login-panel,
+  .app-shell {
+    animation: none;
   }
 }
