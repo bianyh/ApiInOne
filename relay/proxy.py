@@ -6,13 +6,16 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from itertools import chain
+from tempfile import SpooledTemporaryFile
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 from flask import Blueprint, Response, current_app, jsonify, request
+from werkzeug.wsgi import LimitedStream
 
 from relay.auth import resolve_proxy_key
+from relay.response_metadata import read_response_metadata
 from relay.routing import build_upstream_url, resolve_bound_upstream, select_candidates
 from relay.state import RelayState
 from relay.storage import ObjectIndexStore
@@ -37,6 +40,10 @@ _SAFE_FORWARD_HEADERS = {
     "content-encoding",
     "content-type",
     "idempotency-key",
+    "range",
+    "if-range",
+    "if-none-match",
+    "if-modified-since",
     "openai-beta",
     "openai-organization",
     "openai-project",
@@ -59,11 +66,20 @@ def _request_body() -> bytes:
 
 
 def _extract_request_context(path: str) -> dict[str, Any]:
-    body = _request_body()
+    upload = None
+    length = request.content_length
+    if request.mimetype == "multipart/form-data" and length is not None and length > _MAX_CAPTURE_BYTES:
+        source = request.environ["wsgi.input"]
+        if hasattr(source, "seekable") and source.seekable():
+            # Validate the body limit through Werkzeug before rewinding the WSGI input.
+            request.stream
+            upload = (source, source.tell(), length)
+    body = b"" if upload is not None else _request_body()
     parsed = request.get_json(silent=True) if request.mimetype == "application/json" else None
     requested_model = extract_model_from_request(request)
     return {
         "body": body,
+        "upload": upload,
         "json": parsed,
         "path": path,
         "method": request.method,
@@ -121,6 +137,11 @@ def _build_upstream_request_kwargs(upstream_api_key: str, ctx: dict[str, Any]) -
     headers = _proxy_headers(upstream_api_key)
     body = ctx["body"]
     if not ctx.get("model_mapped"):
+        if ctx["upload"] is not None:
+            source, start, length = ctx["upload"]
+            source.seek(start)
+            headers["Content-Length"] = str(length)
+            return {"headers": headers, "content": LimitedStream(source, length)}
         return {"headers": headers, "content": body if body else None}
 
     upstream_model = ctx.get("upstream_model")
@@ -142,12 +163,11 @@ def _build_upstream_request_kwargs(upstream_api_key: str, ctx: dict[str, Any]) -
         return {"headers": headers, "content": urlencode(form_items).encode("utf-8")}
 
     if request.mimetype == "multipart/form-data":
-        data: list[tuple[str, str]] = []
+        parts = []
         for key, values in request.form.lists():
             for value in values:
-                data.append((key, upstream_model if key == "model" else value))
+                parts.append((key, (None, upstream_model if key == "model" else value)))
 
-        files: list[tuple[str, tuple[str, Any, str]]] = []
         for key, values in request.files.lists():
             for item in values:
                 try:
@@ -155,7 +175,7 @@ def _build_upstream_request_kwargs(upstream_api_key: str, ctx: dict[str, Any]) -
                         item.stream.seek(0)
                 except (AttributeError, OSError):
                     pass
-                files.append(
+                parts.append(
                     (
                         key,
                         (
@@ -167,7 +187,7 @@ def _build_upstream_request_kwargs(upstream_api_key: str, ctx: dict[str, Any]) -
                 )
         _drop_header(headers, "content-type")
         _drop_header(headers, "content-encoding")
-        return {"headers": headers, "data": data, "files": files}
+        return {"headers": headers, "files": parts}
 
     return {"headers": headers, "content": body if body else None}
 
@@ -230,8 +250,7 @@ def _build_log_record(
 
 class _StreamUsageTracker:
     def __init__(self) -> None:
-        self.buffer = bytearray()
-        self.skipping_line = False
+        self.buffer = SpooledTemporaryFile(max_size=_MAX_CAPTURE_BYTES, mode="w+b")
         self.created_payload: dict[str, Any] | None = None
         self.last_payload: dict[str, Any] | None = None
         self.failed = False
@@ -242,33 +261,39 @@ class _StreamUsageTracker:
         while start < len(chunk):
             newline = chunk.find(b"\n", start)
             end = len(chunk) if newline == -1 else newline
-            if not self.skipping_line:
-                if len(self.buffer) + end - start <= _MAX_CAPTURE_BYTES:
-                    self.buffer.extend(chunk[start:end])
-                else:
-                    self.buffer.clear()
-                    self.skipping_line = True
+            self.buffer.write(chunk[start:end])
             if newline == -1:
                 return
-            if not self.skipping_line:
-                self._parse_line(self.buffer)
-            self.buffer.clear()
-            self.skipping_line = False
+            size = self.buffer.tell()
+            self._parse_line(size)
+            if size > _MAX_CAPTURE_BYTES:
+                self.buffer.close()
+                self.buffer = SpooledTemporaryFile(max_size=_MAX_CAPTURE_BYTES, mode="w+b")
+            else:
+                self.buffer.seek(0)
+                self.buffer.truncate()
             start = newline + 1
 
-    def _parse_line(self, line: bytearray) -> None:
-        if not line.startswith(b"data:"):
+    def close(self) -> None:
+        self.buffer.close()
+
+    def _parse_line(self, size: int) -> None:
+        self.buffer.seek(0)
+        if self.buffer.read(5) != b"data:":
             return
-        data = line[5:].strip()
-        if not data:
-            return
-        if data == b"[DONE]":
-            self.completed = True
-            return
-        try:
-            parsed = json.loads(data)
-        except (ValueError, RecursionError):
-            return
+        if size > _MAX_CAPTURE_BYTES:
+            parsed = read_response_metadata(self.buffer)
+        else:
+            data = self.buffer.read().strip()
+            if not data:
+                return
+            if data == b"[DONE]":
+                self.completed = True
+                return
+            try:
+                parsed = json.loads(data)
+            except (ValueError, RecursionError):
+                return
         if not isinstance(parsed, dict):
             return
         event_type = parsed.get("type")
@@ -278,7 +303,7 @@ class _StreamUsageTracker:
             self.completed = True
         if event_type in ("response.failed", "error") or isinstance(parsed.get("error"), dict):
             self.failed = True
-        if self.last_payload is None or "usage" in parsed or "response" in parsed:
+        if self.last_payload is None or any(key in parsed for key in ("usage", "response", "objects")):
             self.last_payload = parsed
 
 
@@ -348,24 +373,46 @@ def _forward_stream(
     started: float,
     ttfb_ms: float | None = None,
     track_sse: bool = False,
+    capture_json: bool = False,
+    raw_file: bool = False,
 ) -> Response:
     # Keep only log metadata once the upstream has received the request.
-    metadata = {key: value for key, value in ctx.items() if key not in {"body", "json"}}
-    tracker = _StreamUsageTracker() if track_sse else None
+    metadata = {key: value for key, value in ctx.items() if key not in {"body", "json", "upload"}}
 
     def generate():
         nonlocal ttfb_ms
         status = upstream_response.status_code
         error = None
+        tracker = _StreamUsageTracker() if track_sse else None
+        capture = SpooledTemporaryFile(max_size=_MAX_CAPTURE_BYTES, mode="w+b") if capture_json else None
+        payload = None
         try:
             for chunk in chunks:
                 if ttfb_ms is None:
                     ttfb_ms = (time.perf_counter() - started) * 1000
                 if tracker is not None:
-                    tracker.feed(chunk)
+                    try:
+                        tracker.feed(chunk)
+                    except OSError:
+                        logger.exception("Failed to capture SSE metadata")
+                        tracker.close()
+                        tracker = None
+                if capture is not None:
+                    try:
+                        capture.write(chunk)
+                    except OSError:
+                        logger.exception("Failed to capture JSON response metadata")
+                        capture.close()
+                        capture = None
                 yield chunk
             if tracker is not None and tracker.failed and status < 400:
                 status, error = 502, "Upstream sent a stream error event"
+            if capture is not None:
+                try:
+                    capture.seek(0)
+                    payload = read_response_metadata(capture)
+                except OSError:
+                    logger.exception("Failed to inspect JSON response metadata")
         except GeneratorExit:
             if tracker is not None and tracker.failed:
                 status, error = 502, "Upstream sent a stream error event"
@@ -378,23 +425,32 @@ def _forward_stream(
             raise
         finally:
             upstream_response.close()
+            if capture is not None:
+                capture.close()
+            if tracker is not None:
+                tracker.close()
             _record_result(
                 state, proxy_key, upstream, metadata, status, started, ttfb_ms,
-                payload=tracker.last_payload if tracker else None,
+                payload=tracker.last_payload if tracker else payload,
                 error=error,
                 indexed_payload=tracker.created_payload if tracker else None,
             )
 
-    response = Response(generate(), status=upstream_response.status_code, headers=_response_headers(upstream_response))
+    response = Response(
+        generate(), status=upstream_response.status_code, headers=_response_headers(upstream_response, raw_file)
+    )
     response.call_on_close(upstream_response.close)
     return response
 
 
-def _response_headers(upstream_response: httpx.Response) -> dict[str, str]:
+def _response_headers(upstream_response: httpx.Response, raw_file: bool = False) -> dict[str, str]:
+    excluded = {"transfer-encoding", "connection", "set-cookie"}
+    if not raw_file:
+        excluded.update({"content-length", "content-encoding"})
     return {
         key: value
         for key, value in upstream_response.headers.items()
-        if key.lower() not in {"content-length", "transfer-encoding", "content-encoding", "connection", "set-cookie"}
+        if key.lower() not in excluded
     }
 
 
@@ -484,12 +540,13 @@ def relay_request(subpath: str):
                 last_error = f"upstream {upstream['name']} returned {status}"
                 continue
 
-            chunks = upstream_response.iter_bytes()
             is_sse = "text/event-stream" in content_type
-            # Files can be arbitrarily large. The response body stays in the iterator.
-            if is_sse or (incoming_path.startswith("/v1/files/") and incoming_path.endswith("/content")):
+            raw_file = not is_sse and incoming_path.startswith("/v1/files/") and incoming_path.endswith("/content")
+            chunks = upstream_response.iter_raw() if raw_file else upstream_response.iter_bytes()
+            if is_sse or raw_file:
                 return _forward_stream(
-                    upstream_response, chunks, state, proxy_key, upstream, ctx, started, track_sse=is_sse,
+                    upstream_response, chunks, state, proxy_key, upstream, ctx, started,
+                    track_sse=is_sse, raw_file=raw_file,
                 )
 
             response_bytes = bytearray()
@@ -500,7 +557,7 @@ def relay_request(subpath: str):
                 if len(response_bytes) + len(chunk) > _MAX_CAPTURE_BYTES:
                     return _forward_stream(
                         upstream_response, chain((bytes(response_bytes), chunk), chunks),
-                        state, proxy_key, upstream, ctx, started, ttfb_ms,
+                        state, proxy_key, upstream, ctx, started, ttfb_ms, capture_json="application/json" in content_type,
                     )
                 response_bytes.extend(chunk)
             upstream_response.close()

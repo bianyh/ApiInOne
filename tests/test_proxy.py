@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import gzip
+import json
 import socket
 from io import BytesIO
 
 import httpx
+import pytest
+from werkzeug.test import EnvironBuilder
+from werkzeug.wrappers import Request as WsgiRequest
 
 from tests.conftest import provision_relay
 
@@ -344,13 +348,82 @@ def test_large_download_streams_without_reading_ahead(client, app, upstream_fact
                 consumed.append(chunk)
                 yield chunk
 
+    def respond(request):
+        assert request.headers["Range"] == "bytes=5-20"
+        return httpx.Response(206, stream=Download(), headers={
+            "Content-Type": "application/octet-stream", "Content-Length": "16", "Content-Range": "bytes 5-20/35",
+        })
+
     state.upstream_client.close()
-    state.upstream_client = httpx.Client(transport=httpx.MockTransport(
-        lambda request: httpx.Response(200, stream=Download(), headers={"Content-Type": "application/octet-stream"})
-    ))
-    response = client.get("/v1/files/file_large/content", headers={"Authorization": f"Bearer {proxy_key}"})
+    state.upstream_client = httpx.Client(transport=httpx.MockTransport(respond))
+    response = client.get("/v1/files/file_large/content", headers={
+        "Authorization": f"Bearer {proxy_key}", "Range": "bytes=5-20",
+    })
+    assert response.status_code == 206
+    assert response.headers["Content-Range"] == "bytes 5-20/35"
+    assert response.headers["Content-Length"] == "16"
     assert consumed == [b"first"]
     assert response.get_data() == b"firstsecondthird"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_large_responses_keep_object_routing_and_usage(client, app, upstream_factory, monkeypatch, stream):
+    upstream = upstream_factory("large", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    monkeypatch.setattr("relay.proxy._MAX_CAPTURE_BYTES", 128)
+    state = app.extensions["relay_state"]
+    payload = {
+        "output": [{"text": "x" * 1000, "id": "output_large"}],
+        "id": "resp_large", "object": "response",
+        "usage": {"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+    }
+    if stream:
+        event = {"type": "response.completed", "response": payload}
+        wire = b"data: " + json.dumps(event).encode() + b"\n\n"
+        content_type = "text/event-stream"
+    else:
+        wire = json.dumps(payload).encode()
+        content_type = "application/json"
+
+    state.upstream_client.close()
+    state.upstream_client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=wire, headers={"Content-Type": content_type})
+    ))
+    response = client.post(
+        "/v1/responses", json={"model": "gpt-4.1", "input": "hello", "stream": stream},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.get_data() == wire
+    assert state.object_store.get("resp_large")["upstream_id"] == "large_id"
+    assert state.object_store.get("output_large")["upstream_id"] == "large_id"
+    assert state.request_store.query()["items"][0]["total_tokens"] == 60
+
+
+@pytest.mark.parametrize("model", ["gpt-4.1", "alias"])
+def test_large_multipart_upload_keeps_file_and_form(client, app, upstream_factory, monkeypatch, model):
+    upstream = upstream_factory("upload", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    state = app.extensions["relay_state"]
+    state.config_store.update_app_settings({"model_mappings": {"alias": "gpt-4.1"}})
+    monkeypatch.setattr("relay.proxy._MAX_CAPTURE_BYTES", 128)
+    file_data = b"x" * 1024
+
+    def respond(request):
+        builder = EnvironBuilder(method="POST", data=request.read(), content_type=request.headers["Content-Type"])
+        with WsgiRequest(builder.get_environ()) as forwarded:
+            assert forwarded.form["model"] == "gpt-4.1"
+            assert forwarded.form["purpose"] == "assistants"
+            assert forwarded.files["file"].read() == file_data
+        return httpx.Response(200, json={"id": "file_large", "object": "file"})
+
+    state.upstream_client.close()
+    state.upstream_client = httpx.Client(transport=httpx.MockTransport(respond))
+    response = client.post(
+        "/v1/files", data={"model": model, "purpose": "assistants", "file": (BytesIO(file_data), "upload.txt")},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.status_code == 200
+    assert state.object_store.get("file_large")["upstream_id"] == "upload_id"
 
 
 def test_relay_rejects_oversized_requests(client, app, upstream_factory):

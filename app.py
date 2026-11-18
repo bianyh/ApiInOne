@@ -23,7 +23,7 @@ if __name__ == "__main__":
         port=int(os.getenv("RELAY_PORT", "8000")),
         threads=threads,
         connection_limit=64,
-        channel_timeout=600,
+        channel_timeout=1800,
         max_request_header_size=64 * 1024,
         max_request_body_size=app.config["MAX_CONTENT_LENGTH"],
         outbuf_high_watermark=2 * 1024**2,
