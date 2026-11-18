@@ -19,6 +19,7 @@ def select_candidates(
     model: str | None = None,
     bound_upstream_id: str | None = None,
     endpoint_family: str | None = None,
+    health_failover_enabled: bool = True,
 ) -> list[dict[str, Any]]:
     enabled = [item for item in upstreams if item.get("enabled") and item.get("base_url") and item.get("api_key")]
     if bound_upstream_id:
@@ -26,7 +27,9 @@ def select_candidates(
     if model:
         enabled = [
             item for item in enabled
-            if "*" in item.get("allowed_models", []) or model in item.get("allowed_models", [])
+            if not item.get("allowed_models")
+            or "*" in item.get("allowed_models", [])
+            or model in item.get("allowed_models", [])
         ]
     if endpoint_family:
         enabled = [
@@ -36,25 +39,40 @@ def select_candidates(
         ]
     enabled.sort(key=lambda item: int(item.get("order", 9999)))
     health = health_store.get_all()
+    if not health_failover_enabled:
+        if route_mode != "fastest_first":
+            return enabled
+        return sorted(
+            enabled,
+            key=lambda item: (
+                health.get(item["id"], {}).get("last_probe_success") is False,
+                float(health.get(item["id"], {}).get("passive_avg_ttfb_ms") or 10**9),
+                int(item.get("order", 9999)),
+            ),
+        )
+
     active = [item for item in enabled if not health.get(item["id"], {}).get("timeout_failover_active")]
     suppressed = [item for item in enabled if health.get(item["id"], {}).get("timeout_failover_active")]
 
     if route_mode != "fastest_first":
-        return active or suppressed
+        return active + suppressed
 
     if active:
-        enabled = active
+        primary = active
+        fallback = suppressed
     else:
-        enabled = suppressed
+        primary = suppressed
+        fallback = []
 
-    return sorted(
-        enabled,
+    ranked = sorted(
+        primary,
         key=lambda item: (
             health.get(item["id"], {}).get("last_probe_success") is False,
             float(health.get(item["id"], {}).get("passive_avg_ttfb_ms") or 10**9),
             int(item.get("order", 9999)),
         ),
     )
+    return ranked + fallback
 
 
 def resolve_bound_upstream(path: str, object_store: ObjectIndexStore) -> tuple[str | None, bool]:

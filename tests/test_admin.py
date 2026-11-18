@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from tests.conftest import login_admin
 
 
@@ -24,11 +26,18 @@ def test_admin_login_and_settings_roundtrip(client):
     assert response.status_code == 200
     assert response.get_json()["authenticated"] is True
 
+    default_settings_response = client.get("/admin/api/settings")
+    assert default_settings_response.status_code == 200
+    assert default_settings_response.get_json()["item"]["scheduled_probe_all_enabled"] is False
+
     settings_response = client.put(
         "/admin/api/settings",
         json={
             "title": "私人中转站",
             "route_mode": "fastest_first",
+            "auto_failover_enabled": False,
+            "model_mappings": {"gpt-5.5": "gpt-5.4", "same": "same", "": "ignored"},
+            "scheduled_probe_all_enabled": True,
             "probe_interval_seconds": 60,
             "request_timeout_ms": 45000,
         },
@@ -36,6 +45,31 @@ def test_admin_login_and_settings_roundtrip(client):
     )
     assert settings_response.status_code == 200
     assert settings_response.get_json()["item"]["route_mode"] == "fastest_first"
+    assert settings_response.get_json()["item"]["auto_failover_enabled"] is False
+    assert settings_response.get_json()["item"]["scheduled_probe_all_enabled"] is True
+    assert settings_response.get_json()["item"]["model_mappings"] == {"gpt-5.5": "gpt-5.4"}
+
+
+def test_scheduled_probe_all_job_is_disabled_by_default(app):
+    state = app.extensions["relay_state"]
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.start(paused=True)
+    try:
+        state.health_service._configure_job(scheduler)
+        assert scheduler.get_job("probe_all") is None
+        assert scheduler.get_job("probe_timeout_recovery") is not None
+
+        state.config_store.update_app_settings({"scheduled_probe_all_enabled": True})
+        state.health_service._configure_job(scheduler)
+        assert scheduler.get_job("probe_all") is not None
+        assert scheduler.get_job("probe_timeout_recovery") is not None
+
+        state.config_store.update_app_settings({"scheduled_probe_all_enabled": False})
+        state.health_service._configure_job(scheduler)
+        assert scheduler.get_job("probe_all") is None
+        assert scheduler.get_job("probe_timeout_recovery") is not None
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 def test_admin_upstreams_and_proxy_keys(client, app, upstream_factory):
@@ -136,7 +170,39 @@ def test_upstream_model_discovery_and_auto_fill(client, upstream_factory):
     assert item["models_detected_at"] is not None
 
 
-def test_health_probe_requires_valid_model_list(client, upstream_factory):
+def test_upstream_can_be_saved_without_model_discovery(client, upstream_factory):
+    upstream = upstream_factory("no-models-required", ["gpt-4.1"], models_mode="invalid_json")
+    session_payload = login_admin(client)
+    csrf = session_payload["csrf_token"]
+
+    save_response = client.put(
+        "/admin/api/upstreams",
+        json={
+            "upstreams": [
+                {
+                    "id": "direct_add_id",
+                    "name": "直接添加节点",
+                    "base_url": upstream.base_url,
+                    "api_key": "secret-up-key",
+                    "enabled": True,
+                    "order": 1,
+                    "allowed_models": [],
+                    "endpoint_capabilities": ["*"],
+                    "timeout_ms": 10000,
+                    "probe_enabled": True,
+                }
+            ]
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert save_response.status_code == 200
+    assert upstream.models_calls == 0
+    item = client.get("/admin/api/upstreams").get_json()["items"][0]
+    assert item["allowed_models"] == []
+
+
+def test_health_probe_can_continue_when_model_list_is_invalid(client, upstream_factory):
     upstream = upstream_factory("invalid-probe", ["gpt-4.1"], models_mode="invalid_json")
     session_payload = login_admin(client)
     csrf = session_payload["csrf_token"]
@@ -170,10 +236,12 @@ def test_health_probe_requires_valid_model_list(client, upstream_factory):
     )
     assert probe_response.status_code == 200
     payload = probe_response.get_json()["item"]
-    assert payload["last_probe_success"] is False
+    assert payload["last_probe_success"] is True
     assert payload["last_probe_status_code"] == 200
     assert payload["last_probe_model_count"] == 0
-    assert "valid JSON" in payload["last_probe_error"]
+    assert payload["last_probe_endpoint"] == "chat.completions"
+    assert payload["last_probe_reply_excerpt"] == "Hello!"
+    assert payload["last_probe_error"] is None
 
 
 def test_health_probe_marks_valid_model_list_healthy(client, upstream_factory):
@@ -298,3 +366,50 @@ def test_health_probe_can_use_selected_probe_model(client, upstream_factory):
     assert payload["last_probe_success"] is True
     assert payload["last_probe_model_used"] == "gpt-4.1"
     assert payload["last_probe_reply_excerpt"] == "Hello!"
+
+
+def test_health_probe_can_use_responses_endpoint(client, upstream_factory):
+    upstream = upstream_factory("responses-probe", ["gpt-4.1"])
+    session_payload = login_admin(client)
+    csrf = session_payload["csrf_token"]
+
+    save_response = client.put(
+        "/admin/api/upstreams",
+        json={
+            "upstreams": [
+                {
+                    "id": "responses_probe_id",
+                    "name": "Responses 探活节点",
+                    "base_url": upstream.base_url,
+                    "api_key": "secret-up-key",
+                    "enabled": True,
+                    "order": 1,
+                    "allowed_models": ["gpt-4.1"],
+                    "endpoint_capabilities": ["responses"],
+                    "timeout_ms": 10000,
+                    "probe_enabled": True,
+                }
+            ]
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert save_response.status_code == 200
+
+    probe_response = client.post(
+        "/admin/api/health/probe",
+        json={
+            "upstream_id": "responses_probe_id",
+            "probe_model": "gpt-4.1",
+            "probe_endpoint": "responses",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert probe_response.status_code == 200
+    payload = probe_response.get_json()["item"]
+    assert payload["last_probe_success"] is True
+    assert payload["last_probe_model_used"] == "gpt-4.1"
+    assert payload["last_probe_endpoint"] == "responses"
+    assert payload["last_probe_reply_excerpt"] == "Hello!"
+    assert upstream.responses_calls == 1
+    assert upstream.chat_calls == 0

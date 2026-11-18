@@ -38,6 +38,19 @@ def hash_proxy_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
+def normalize_model_mappings(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for source, target in value.items():
+        source_model = str(source or "").strip()
+        target_model = str(target or "").strip()
+        if not source_model or not target_model or source_model == target_model:
+            continue
+        normalized[source_model] = target_model
+    return normalized
+
+
 class ConfigStore:
     def __init__(self, config_path: str | Path | None = None):
         self.config_path = Path(config_path or DEFAULT_CONFIG_PATH)
@@ -91,6 +104,8 @@ class ConfigStore:
 
     def update_app_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         config = self.get_config()
+        if "model_mappings" in patch:
+            patch["model_mappings"] = normalize_model_mappings(patch["model_mappings"])
         config["app"].update(patch)
         return self.save_config(config)["app"]
 

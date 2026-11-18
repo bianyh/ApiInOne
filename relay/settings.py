@@ -21,6 +21,9 @@ DEFAULT_CONFIG = {
     "app": {
         "title": "API 中转站",
         "route_mode": "ordered_failover",
+        "auto_failover_enabled": True,
+        "model_mappings": {},
+        "scheduled_probe_all_enabled": False,
         "probe_interval_seconds": 300,
         "request_timeout_ms": 120000,
         "passive_window_size": 50,

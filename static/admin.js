@@ -23,9 +23,13 @@
         settings: {
           title: "API 中转站",
           route_mode: "ordered_failover",
+          auto_failover_enabled: true,
+          model_mappings: {},
+          scheduled_probe_all_enabled: false,
           probe_interval_seconds: 300,
           request_timeout_ms: 120000,
         },
+        modelMappingRows: [],
         upstreams: [],
         proxyKeys: [],
         healthItems: [],
@@ -57,6 +61,7 @@
         charts: {},
         healthProbeJob: null,
         probeModelSelections: {},
+        probeEndpointSelections: {},
         draggingUpstreamId: null,
         upstreamDialog: {
           visible: false,
@@ -131,6 +136,29 @@
           ? "来源 已保存"
           : "来源 本次探查";
       },
+      modelMappingModelOptions() {
+        const models = new Set();
+        [...this.upstreams, ...this.healthItems].forEach((item) => {
+          if (Array.isArray(item.allowed_models)) {
+            item.allowed_models.forEach((model) => {
+              const normalized = String(model || "").trim();
+              if (normalized) {
+                models.add(normalized);
+              }
+            });
+          }
+          this.parseModelsText(item.allowed_models_text).forEach((model) => models.add(model));
+        });
+        Object.entries(this.settings.model_mappings || {}).forEach(([source, target]) => {
+          if (source) {
+            models.add(source);
+          }
+          if (target) {
+            models.add(target);
+          }
+        });
+        return Array.from(models).sort();
+      },
     },
     mounted() {
       this.bootstrap();
@@ -187,6 +215,7 @@
           endpoint_capabilities: Array.isArray(item.endpoint_capabilities) && item.endpoint_capabilities.length
             ? item.endpoint_capabilities
             : ["*"],
+          allowed_models: Array.isArray(item.allowed_models) ? item.allowed_models : [],
           allowed_models_text: Array.isArray(item.allowed_models) ? item.allowed_models.join("\n") : "",
           models_detected_at: item.models_detected_at || null,
         };
@@ -196,6 +225,30 @@
           .split("\n")
           .map((line) => line.trim())
           .filter(Boolean);
+      },
+      syncModelMappingRows() {
+        this.modelMappingRows = Object.entries(this.settings.model_mappings || {}).map(([source, target]) => ({
+          source,
+          target,
+        }));
+      },
+      buildModelMappings() {
+        const mappings = {};
+        this.modelMappingRows.forEach((row) => {
+          const source = String(row.source || "").trim();
+          const target = String(row.target || "").trim();
+          if (!source || !target || source === target) {
+            return;
+          }
+          mappings[source] = target;
+        });
+        return mappings;
+      },
+      addModelMapping() {
+        this.modelMappingRows.push({ source: "", target: "" });
+      },
+      removeModelMapping(index) {
+        this.modelMappingRows.splice(index, 1);
       },
       modelCount(item) {
         return this.parseModelsText(item.allowed_models_text).length;
@@ -348,20 +401,62 @@
         return mapping[stage] || stage;
       },
       probeModelOptions(item) {
-        const models = new Set(["gpt-5.4"]);
+        const models = new Set();
+        if (Array.isArray(item.allowed_models)) {
+          item.allowed_models
+            .map((model) => String(model || "").trim())
+            .filter(Boolean)
+            .forEach((model) => models.add(model));
+        }
         this.parseModelsText(item.allowed_models_text).forEach((model) => models.add(model));
+        const lastProbeModel = item.health && item.health.last_probe_model_used;
+        if (lastProbeModel) {
+          models.add(lastProbeModel);
+        }
+        models.add("gpt-5.4");
         return Array.from(models);
+      },
+      probeEndpointOptions(item) {
+        const endpoints = new Set();
+        const capabilities = Array.isArray(item.endpoint_capabilities) ? item.endpoint_capabilities : [];
+        if (capabilities.includes("*") || capabilities.includes("chat.completions")) {
+          endpoints.add("chat.completions");
+        }
+        if (capabilities.includes("*") || capabilities.includes("responses")) {
+          endpoints.add("responses");
+        }
+        if (!endpoints.size) {
+          endpoints.add("chat.completions");
+          endpoints.add("responses");
+        }
+        return Array.from(endpoints);
       },
       selectedProbeModel(item) {
         return this.probeModelSelections[item.id] || "gpt-5.4";
       },
       syncProbeSelections() {
         const nextSelections = {};
-        this.upstreams.forEach((item) => {
+        const nextEndpointSelections = {};
+        const itemsById = new Map();
+        [...this.upstreams, ...this.healthItems].forEach((item) => {
+          if (item && item.id) {
+            itemsById.set(item.id, item);
+          }
+        });
+        itemsById.forEach((item) => {
           const previous = this.probeModelSelections[item.id];
-          nextSelections[item.id] = previous || "gpt-5.4";
+          const modelOptions = this.probeModelOptions(item);
+          nextSelections[item.id] = modelOptions.includes(previous)
+            ? previous
+            : modelOptions[0] || "gpt-5.4";
+          const endpointOptions = this.probeEndpointOptions(item);
+          const previousEndpoint = this.probeEndpointSelections[item.id];
+          nextEndpointSelections[item.id] = endpointOptions.includes(previousEndpoint)
+            ? previousEndpoint
+            : endpointOptions[0];
         });
         this.probeModelSelections = nextSelections;
+        this.probeEndpointSelections = nextEndpointSelections;
       },
       upstreamPriorityPreview(item) {
         return `${item.order || 0}. ${item.name}`;
@@ -454,16 +549,22 @@
       async loadSettings() {
         const payload = await this.api("/admin/api/settings");
         this.settings = { ...this.settings, ...payload.item };
+        this.syncModelMappingRows();
         this.pageTitle = this.settings.title || this.pageTitle;
       },
       async saveSettings() {
         this.loading.settings = true;
         try {
+          const settingsPayload = {
+            ...this.settings,
+            model_mappings: this.buildModelMappings(),
+          };
           const payload = await this.api("/admin/api/settings", {
             method: "PUT",
-            body: JSON.stringify(this.settings),
+            body: JSON.stringify(settingsPayload),
           });
           this.settings = payload.item;
+          this.syncModelMappingRows();
           this.pageTitle = payload.item.title;
           message.success("设置已保存");
         } finally {
@@ -587,7 +688,7 @@
           endpoint_capabilities: item.endpoint_capabilities,
           allowed_models: allowedModels,
           models_detected_at: item.models_detected_at,
-          auto_discover_models: allowedModels.length === 0,
+          auto_discover_models: false,
         };
       },
       async persistUpstreams(items, successMessage) {
@@ -617,9 +718,6 @@
         }
         this.loading.upstreamDialog = true;
         try {
-          if (!this.parseModelsText(form.allowed_models_text).length) {
-            await this.discoverDialogModels(true);
-          }
           const draft = this.cloneObject(this.upstreamDialog.form);
           let nextItems;
           if (this.upstreamDialog.mode === "edit") {
@@ -728,7 +826,11 @@
       },
       async loadHealth() {
         const payload = await this.api("/admin/api/health");
-        this.healthItems = payload.items;
+        this.healthItems = payload.items.map((item, index) => ({
+          ...this.normalizeUpstream(item, index),
+          health: item.health || {},
+        }));
+        this.syncProbeSelections();
       },
       async startProbeJob(upstreamId = null) {
         this.loading.health = true;
@@ -737,10 +839,14 @@
             ? {
                 upstream_id: upstreamId,
                 probe_model: this.probeModelSelections[upstreamId] || "gpt-5.4",
+                probe_endpoint: this.probeEndpointSelections[upstreamId] || "chat.completions",
               }
             : {
                 probe_models: Object.fromEntries(
                   this.upstreams.map((item) => [item.id, this.probeModelSelections[item.id] || "gpt-5.4"]),
+                ),
+                probe_endpoints: Object.fromEntries(
+                  this.upstreams.map((item) => [item.id, this.probeEndpointSelections[item.id] || "chat.completions"]),
                 ),
               };
           const payload = await this.api("/admin/api/health/probe/jobs", {

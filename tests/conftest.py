@@ -38,6 +38,9 @@ class MockUpstreamServer:
         self.models_calls = 0
         self.responses_calls = 0
         self.chat_calls = 0
+        self.last_response_headers: dict[str, str] = {}
+        self.last_response_json: dict = {}
+        self.last_response_form: dict = {}
         self.files: dict[str, dict] = {}
         self._app = Flask(f"mock_{name}")
         self._server = None
@@ -65,7 +68,10 @@ class MockUpstreamServer:
         @self._app.post("/v1/responses")
         def responses():
             self.responses_calls += 1
+            self.last_response_headers = dict(request.headers)
             payload = request.get_json(silent=True) or {}
+            self.last_response_json = payload
+            self.last_response_form = request.form.to_dict(flat=True)
             if self.fail_responses > 0:
                 self.fail_responses -= 1
                 return jsonify({"error": {"message": "temporary failure"}}), 500

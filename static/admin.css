@@ -1047,7 +1047,25 @@ body {
 }
 
 .settings-form {
-  max-width: 560px;
+  max-width: 880px;
+}
+
+.model-mapping-editor {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+}
+
+.model-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.mapping-arrow {
+  color: var(--muted);
+  font-weight: 700;
 }
 
 .code-block {
@@ -1387,7 +1405,8 @@ code {
   }
 
   .dialog-grid,
-  .double-grid {
+  .double-grid,
+  .model-mapping-row {
     grid-template-columns: 1fr;
   }
 }

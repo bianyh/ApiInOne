@@ -137,7 +137,7 @@
               <div class="hero-main">
                 <span class="eyebrow">Setup Guide</span>
                 <h3>最快的使用路径</h3>
-                <p>先添加上游节点并自动探查模型，再创建代理 Key，最后把你其他机器的 `base_url` 指向这个中转站。</p>
+                <p>先添加上游节点，可按需探查模型，再创建代理 Key，最后把你其他机器的 `base_url` 指向这个中转站。</p>
                 <div class="hero-actions">
                   <el-button type="primary" @click="handleTabChange('upstreams')">先添加节点</el-button>
                   <el-button @click="handleTabChange('keys')">再创建代理 Key</el-button>
@@ -236,8 +236,8 @@
                   <div class="wizard-step" :class="{ complete: uniqueModelCount > 0 }">
                     <span>2</span>
                     <div>
-                      <strong>自动探查模型</strong>
-                      <small>点击“自动探查模型”，把上游支持的模型拉回来展示出来。</small>
+                      <strong>按需探查模型</strong>
+                      <small>点击“自动探查模型”可同步模型列表；也可以直接保存节点。</small>
                     </div>
                   </div>
                   <div class="wizard-step" :class="{ complete: enabledUpstreamCount > 0 }">
@@ -579,7 +579,21 @@
                     <span v-if="item.health.last_probe_error">最近问题: {{ item.health.last_probe_error }}</span>
                   </div>
                   <div class="probe-selector-row">
-                    <el-select v-model="probeModelSelections[item.id]" placeholder="选择探活模型">
+                    <el-select v-model="probeEndpointSelections[item.id]" placeholder="选择探活接口">
+                      <el-option
+                        v-for="endpoint in probeEndpointOptions(item)"
+                        :key="`${item.id}-probe-endpoint-${endpoint}`"
+                        :label="endpoint"
+                        :value="endpoint"
+                      ></el-option>
+                    </el-select>
+                    <el-select
+                      v-model="probeModelSelections[item.id]"
+                      filterable
+                      allow-create
+                      default-first-option
+                      placeholder="选择或输入探活模型"
+                    >
                       <el-option
                         v-for="model in probeModelOptions(item)"
                         :key="`${item.id}-probe-${model}`"
@@ -587,7 +601,7 @@
                         :value="model"
                       ></el-option>
                     </el-select>
-                    <span class="probe-selector-hint">默认使用 `gpt-5.4`，也可改成该节点已探测到的模型。</span>
+                    <span class="probe-selector-hint">可选择 `chat.completions` 或 `responses`，模型名支持直接输入。</span>
                   </div>
                   <div v-if="probeStepTrail(item).length" class="probe-status-panel" :class="{ live: isProbingItem(item) }">
                     <div class="probe-status-head">
@@ -638,8 +652,68 @@
                     <el-option label="按测速优选" value="fastest_first"></el-option>
                   </el-select>
                 </el-form-item>
-                <el-form-item label="探活间隔（秒）">
-                  <el-input-number v-model="settings.probe_interval_seconds" :min="30" :step="30"></el-input-number>
+                <el-form-item label="自动切换站点">
+                  <el-switch
+                    v-model="settings.auto_failover_enabled"
+                    active-text="开启"
+                    inactive-text="关闭"
+                  ></el-switch>
+                </el-form-item>
+                <el-form-item label="定时探活全部节点">
+                  <el-switch
+                    v-model="settings.scheduled_probe_all_enabled"
+                    active-text="开启"
+                    inactive-text="关闭"
+                  ></el-switch>
+                </el-form-item>
+                <el-form-item label="模型映射转发">
+                  <div class="model-mapping-editor">
+                    <div
+                      v-for="(row, index) in modelMappingRows"
+                      :key="`model-mapping-${index}`"
+                      class="model-mapping-row"
+                    >
+                      <el-select
+                        v-model="row.source"
+                        filterable
+                        allow-create
+                        default-first-option
+                        placeholder="请求模型"
+                      >
+                        <el-option
+                          v-for="model in modelMappingModelOptions"
+                          :key="`mapping-source-${index}-${model}`"
+                          :label="model"
+                          :value="model"
+                        ></el-option>
+                      </el-select>
+                      <span class="mapping-arrow">→</span>
+                      <el-select
+                        v-model="row.target"
+                        filterable
+                        allow-create
+                        default-first-option
+                        placeholder="上游模型"
+                      >
+                        <el-option
+                          v-for="model in modelMappingModelOptions"
+                          :key="`mapping-target-${index}-${model}`"
+                          :label="model"
+                          :value="model"
+                        ></el-option>
+                      </el-select>
+                      <el-button type="danger" plain @click="removeModelMapping(index)">删除</el-button>
+                    </div>
+                    <el-button @click="addModelMapping">新增映射</el-button>
+                  </div>
+                </el-form-item>
+                <el-form-item label="全量探活间隔（秒）">
+                  <el-input-number
+                    v-model="settings.probe_interval_seconds"
+                    :min="30"
+                    :step="30"
+                    :disabled="!settings.scheduled_probe_all_enabled"
+                  ></el-input-number>
                 </el-form-item>
                 <el-form-item label="默认超时（毫秒）">
                   <el-input-number v-model="settings.request_timeout_ms" :min="1000" :step="1000"></el-input-number>
@@ -710,7 +784,7 @@
                     自动探查模型
                   </el-button>
                 </div>
-                <p class="helper-text">填写 `base_url` 和 `api_key` 后点击探查。编辑已有节点时，如不改 Key，可直接留空并使用后台已保存的 Key 进行探查。</p>
+                <p class="helper-text">填写 `base_url` 和 `api_key` 后可点击探查；也可以不探查直接保存。编辑已有节点时，如不改 Key，可直接留空并使用后台已保存的 Key 进行探查。</p>
                 <el-alert
                   v-if="upstreamDialog.discovery"
                   class="spaced-alert"
@@ -730,8 +804,8 @@
                   <div class="wizard-step compact">
                     <span>2</span>
                     <div>
-                      <strong>点击自动探查</strong>
-                      <small>系统会请求上游 `/v1/models` 并同步模型列表。</small>
+                      <strong>按需自动探查</strong>
+                      <small>系统会请求上游 `/v1/models` 并同步模型列表；无法探查时也可直接保存。</small>
                     </div>
                   </div>
                 </div>
@@ -776,7 +850,7 @@
                   v-model="upstreamDialog.form.allowed_models_text"
                   type="textarea"
                   :rows="7"
-                  placeholder="每行一个模型名。若留空，保存时会自动尝试探查。"
+                  placeholder="每行一个模型名。留空表示不限制模型，不会阻止保存节点。"
                 ></el-input>
               </div>
             </div>

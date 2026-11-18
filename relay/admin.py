@@ -116,8 +116,7 @@ def save_upstreams():
     for upstream in upstreams:
         item = dict(upstream)
         should_discover = bool(item.get("auto_discover_models"))
-        allowed_models = [value for value in item.get("allowed_models", []) if str(value).strip()]
-        if should_discover or not allowed_models:
+        if should_discover:
             try:
                 item = _auto_fill_models(item)
             except UpstreamDiscoveryError as exc:
@@ -195,6 +194,9 @@ def update_settings():
     allowed_fields = {
         "title",
         "route_mode",
+        "auto_failover_enabled",
+        "model_mappings",
+        "scheduled_probe_all_enabled",
         "probe_interval_seconds",
         "request_timeout_ms",
         "passive_window_size",
@@ -250,12 +252,17 @@ def probe_health():
     payload = request.get_json(silent=True) or {}
     upstream_id = payload.get("upstream_id")
     probe_model = payload.get("probe_model")
+    probe_endpoint = payload.get("probe_endpoint")
     upstreams = get_state().config_store.list_upstreams()
     if upstream_id:
         upstream = next((item for item in upstreams if item["id"] == upstream_id), None)
         if not upstream:
             return jsonify({"error": {"message": "Upstream not found"}}), 404
-        result = get_state().health_service.probe_one(upstream, probe_model_override=probe_model)
+        result = get_state().health_service.probe_one(
+            upstream,
+            probe_model_override=probe_model,
+            probe_endpoint_override=probe_endpoint,
+        )
         return jsonify({"item": result})
     return jsonify({"items": get_state().health_service.probe_all()})
 
@@ -267,16 +274,25 @@ def start_probe_job():
     payload = request.get_json(silent=True) or {}
     upstream_id = payload.get("upstream_id")
     probe_model = payload.get("probe_model")
+    probe_endpoint = payload.get("probe_endpoint")
     probe_models = payload.get("probe_models") if isinstance(payload.get("probe_models"), dict) else {}
+    probe_endpoints = payload.get("probe_endpoints") if isinstance(payload.get("probe_endpoints"), dict) else {}
     upstreams = get_state().config_store.list_upstreams()
     if upstream_id:
         upstream = next((item for item in upstreams if item["id"] == upstream_id), None)
         if not upstream:
             return jsonify({"error": {"message": "Upstream not found"}}), 404
         selected_models = dict(probe_models)
+        selected_endpoints = dict(probe_endpoints)
         if isinstance(probe_model, str) and probe_model.strip():
             selected_models[upstream_id] = probe_model.strip()
-        job = get_state().health_service.start_probe_job([upstream], probe_models=selected_models)
+        if isinstance(probe_endpoint, str) and probe_endpoint.strip():
+            selected_endpoints[upstream_id] = probe_endpoint.strip()
+        job = get_state().health_service.start_probe_job(
+            [upstream],
+            probe_models=selected_models,
+            probe_endpoints=selected_endpoints,
+        )
         return jsonify({"item": job}), 202
 
     targets = [item for item in upstreams if item.get("enabled") and item.get("probe_enabled")]
@@ -287,7 +303,16 @@ def start_probe_job():
         for key, value in probe_models.items()
         if isinstance(value, str) and str(value).strip()
     }
-    job = get_state().health_service.start_probe_job(targets, probe_models=normalized_probe_models)
+    normalized_probe_endpoints = {
+        key: str(value).strip()
+        for key, value in probe_endpoints.items()
+        if isinstance(value, str) and str(value).strip()
+    }
+    job = get_state().health_service.start_probe_job(
+        targets,
+        probe_models=normalized_probe_models,
+        probe_endpoints=normalized_probe_endpoints,
+    )
     return jsonify({"item": job}), 202
 
 

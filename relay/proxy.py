@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
@@ -23,6 +24,21 @@ from relay.utils import (
 proxy_bp = Blueprint("proxy", __name__)
 
 
+_SAFE_FORWARD_HEADERS = {
+    "accept",
+    "accept-language",
+    "content-encoding",
+    "content-type",
+    "idempotency-key",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+    "openai-version",
+    "anthropic-beta",
+    "anthropic-version",
+}
+
+
 def get_state():
     return current_app.extensions["relay_state"]
 
@@ -38,23 +54,39 @@ def _request_body() -> bytes:
 def _extract_request_context(path: str) -> dict[str, Any]:
     body = _request_body()
     parsed = parse_json_bytes(body) if request.mimetype == "application/json" else None
+    requested_model = extract_model_from_request(request)
     return {
         "body": body,
         "json": parsed,
-        "model": extract_model_from_request(request),
+        "model": requested_model,
+        "requested_model": requested_model,
+        "upstream_model": requested_model,
+        "model_mapped": False,
         "endpoint_family": infer_endpoint_family(path),
     }
 
 
+def _apply_model_mapping(ctx: dict[str, Any], model_mappings: dict[str, str]) -> None:
+    requested_model = ctx.get("requested_model")
+    upstream_model = model_mappings.get(requested_model, requested_model) if requested_model else None
+    ctx["upstream_model"] = upstream_model
+    ctx["model_mapped"] = bool(requested_model and upstream_model and requested_model != upstream_model)
+
+
 def _proxy_headers(upstream_api_key: str) -> dict[str, str]:
-    passthrough = {}
-    drop_headers = {"host", "content-length", "authorization"}
+    headers = {"Authorization": f"Bearer {upstream_api_key}"}
     for key, value in request.headers.items():
-        if key.lower() in drop_headers:
+        normalized = key.lower()
+        if normalized not in _SAFE_FORWARD_HEADERS:
             continue
-        passthrough[key] = value
-    passthrough["Authorization"] = f"Bearer {upstream_api_key}"
-    return passthrough
+        headers[key] = value
+    return headers
+
+
+def _drop_header(headers: dict[str, str], name: str) -> None:
+    for key in list(headers.keys()):
+        if key.lower() == name:
+            headers.pop(key, None)
 
 
 def _merged_models():
@@ -66,7 +98,69 @@ def _merged_models():
             if model == "*":
                 continue
             models.setdefault(model, {"id": model, "object": "model", "owned_by": upstream["name"]})
+    for source_model, target_model in get_state().config_store.get_app_settings().get("model_mappings", {}).items():
+        if not source_model or not target_model:
+            continue
+        models.setdefault(
+            source_model,
+            {"id": source_model, "object": "model", "owned_by": f"mapped_to:{target_model}"},
+        )
     return {"object": "list", "data": list(models.values())}
+
+
+def _build_upstream_request_kwargs(upstream_api_key: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    headers = _proxy_headers(upstream_api_key)
+    body = ctx["body"]
+    if not ctx.get("model_mapped"):
+        return {"headers": headers, "content": body if body else None}
+
+    upstream_model = ctx.get("upstream_model")
+    if not upstream_model:
+        return {"headers": headers, "content": body if body else None}
+
+    if request.mimetype == "application/json" and isinstance(ctx.get("json"), dict):
+        payload = dict(ctx["json"])
+        payload["model"] = upstream_model
+        rewritten = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return {"headers": headers, "content": rewritten}
+
+    if request.mimetype == "application/x-www-form-urlencoded":
+        form_items: list[tuple[str, str]] = []
+        for key, values in request.form.lists():
+            for value in values:
+                form_items.append((key, upstream_model if key == "model" else value))
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        return {"headers": headers, "content": urlencode(form_items).encode("utf-8")}
+
+    if request.mimetype == "multipart/form-data":
+        data: list[tuple[str, str]] = []
+        for key, values in request.form.lists():
+            for value in values:
+                data.append((key, upstream_model if key == "model" else value))
+
+        files: list[tuple[str, tuple[str, Any, str]]] = []
+        for key, values in request.files.lists():
+            for item in values:
+                try:
+                    if item.stream and item.stream.seekable():
+                        item.stream.seek(0)
+                except (AttributeError, OSError):
+                    pass
+                files.append(
+                    (
+                        key,
+                        (
+                            item.filename or "upload",
+                            item.stream,
+                            item.content_type or "application/octet-stream",
+                        ),
+                    )
+                )
+        _drop_header(headers, "content-type")
+        _drop_header(headers, "content-encoding")
+        return {"headers": headers, "data": data, "files": files}
+
+    return {"headers": headers, "content": body if body else None}
 
 
 def _index_response_objects(store: ObjectIndexStore, upstream_id: str, payload: Any) -> None:
@@ -99,7 +193,10 @@ def _build_log_record(
         "path": request.path,
         "method": request.method,
         "endpoint_family": ctx["endpoint_family"],
-        "model": ctx["model"],
+        "model": ctx["requested_model"],
+        "requested_model": ctx["requested_model"],
+        "upstream_model": ctx["upstream_model"],
+        "model_mapped": ctx["model_mapped"],
         "proxy_key_id": proxy_key["id"],
         "proxy_key_name": proxy_key["name"],
         "upstream_id": upstream["id"],
@@ -142,19 +239,33 @@ class _StreamUsageTracker:
                 self.last_payload = parsed
 
 
-def _passive_health(upstream_id: str, status_code: int, ttfb_ms: float | None) -> None:
+def _passive_health(upstream_id: str, status_or_success: int | bool, ttfb_ms: float | None) -> None:
+    if isinstance(status_or_success, bool):
+        success = status_or_success
+    else:
+        success = int(status_or_success) < 400
     get_state().health_store.record_passive_result(
         upstream_id,
-        success=status_code < 400,
+        success=success,
         ttfb_ms=ttfb_ms,
     )
 
 
-def _mark_timeout_failover(upstream: dict[str, Any], exc: Exception) -> None:
+def _mark_upstream_failover(upstream: dict[str, Any], exc: Exception, label: str = "Network error") -> None:
     get_state().health_store.mark_timeout_failover(
         upstream["id"],
-        f"Timeout: {type(exc).__name__}: {str(exc)}"[:240],
+        f"{label}: {type(exc).__name__}: {str(exc)}"[:240],
     )
+
+
+def _maybe_mark_upstream_failover(
+    upstream: dict[str, Any],
+    exc: Exception,
+    auto_failover_enabled: bool,
+    label: str = "Network error",
+) -> None:
+    if auto_failover_enabled:
+        _mark_upstream_failover(upstream, exc, label=label)
 
 
 def _log_request(record: dict[str, Any], proxy_key_id: str) -> None:
@@ -181,6 +292,9 @@ def relay_request(subpath: str):
         return _error("Invalid relay API key", 401, "authentication_error")
 
     incoming_path = f"/v1/{subpath}"
+    if request.method == "GET" and incoming_path == "/v1/models":
+        return jsonify(_merged_models())
+
     ctx = _extract_request_context(incoming_path)
     bound_upstream_id, requires_known_object = resolve_bound_upstream(incoming_path, state.object_store)
     if requires_known_object and not bound_upstream_id:
@@ -190,23 +304,31 @@ def relay_request(subpath: str):
             "relay_object_not_indexed",
         )
 
-    route_mode = state.config_store.get_app_settings().get("route_mode", "ordered_failover")
+    app_settings = state.config_store.get_app_settings()
+    model_mappings = app_settings.get("model_mappings") if isinstance(app_settings.get("model_mappings"), dict) else {}
+    _apply_model_mapping(ctx, model_mappings)
+    route_mode = app_settings.get("route_mode", "ordered_failover")
+    auto_failover_enabled = bool(app_settings.get("auto_failover_enabled", True))
     candidates = select_candidates(
         state.config_store.list_upstreams(),
         route_mode="fastest_first" if route_mode == "fastest_first" else "ordered_failover",
         health_store=state.health_store,
-        model=ctx["model"],
+        model=ctx["upstream_model"],
         bound_upstream_id=bound_upstream_id,
         endpoint_family=ctx["endpoint_family"],
+        health_failover_enabled=auto_failover_enabled,
     )
     if not candidates:
-        if ctx["model"]:
-            return _error(f"No upstream supports model '{ctx['model']}'", 404, "model_not_found")
+        if ctx["upstream_model"]:
+            message = f"No upstream supports model '{ctx['upstream_model']}'"
+            if ctx["model_mapped"]:
+                message = f"No upstream supports mapped model '{ctx['upstream_model']}' for requested model '{ctx['requested_model']}'"
+            return _error(message, 404, "model_not_found")
         return _error("No available upstream configured.", 503, "api_error")
+    if not auto_failover_enabled:
+        candidates = candidates[:1]
 
     last_error = None
-    body = ctx["body"]
-    headers = None
     query_params = request.query_string.decode("utf-8", errors="ignore")
 
     for index, upstream in enumerate(candidates):
@@ -216,10 +338,10 @@ def relay_request(subpath: str):
         response_payload = None
         client = None
         try:
-            headers = _proxy_headers(upstream["api_key"])
             target_url = build_upstream_url(upstream["base_url"], incoming_path)
             if query_params:
                 target_url = f"{target_url}?{query_params}"
+            request_kwargs = _build_upstream_request_kwargs(upstream["api_key"], ctx)
 
             client = httpx.Client(
                 timeout=httpx.Timeout(normalize_timeout_seconds(upstream.get("timeout_ms", 120000))),
@@ -229,20 +351,21 @@ def relay_request(subpath: str):
                 client.build_request(
                     request.method,
                     target_url,
-                    headers=headers,
-                    content=body if body else None,
+                    **request_kwargs,
                 ),
                 stream=True,
             )
             content_type = upstream_response.headers.get("content-type", "")
             is_stream = "text/event-stream" in content_type.lower()
 
-            if upstream_response.status_code >= 500 and index < len(candidates) - 1:
+            if upstream_response.status_code >= 500 and auto_failover_enabled and index < len(candidates) - 1:
                 _passive_health(upstream["id"], False, None)
                 if _is_timeout_status(upstream_response.status_code):
-                    _mark_timeout_failover(
+                    _maybe_mark_upstream_failover(
                         upstream,
                         RuntimeError(f"HTTP {upstream_response.status_code} upstream timeout response"),
+                        auto_failover_enabled,
+                        label="Timeout",
                     )
                 last_error = f"upstream {upstream['name']} returned {upstream_response.status_code}"
                 upstream_response.close()
@@ -293,12 +416,14 @@ def relay_request(subpath: str):
             response_bytes = upstream_response.read()
             ttfb_ms = round((time.perf_counter() - started) * 1000, 2)
             duration_ms = round((time.perf_counter() - started) * 1000, 2)
-            if upstream_response.status_code >= 500 and index < len(candidates) - 1:
+            if upstream_response.status_code >= 500 and auto_failover_enabled and index < len(candidates) - 1:
                 _passive_health(upstream["id"], False, None)
                 if _is_timeout_status(upstream_response.status_code):
-                    _mark_timeout_failover(
+                    _maybe_mark_upstream_failover(
                         upstream,
                         RuntimeError(f"HTTP {upstream_response.status_code} upstream timeout response"),
+                        auto_failover_enabled,
+                        label="Timeout",
                     )
                 last_error = f"upstream {upstream['name']} returned {upstream_response.status_code}"
                 upstream_response.close()
@@ -306,9 +431,11 @@ def relay_request(subpath: str):
                 continue
 
             if _is_timeout_status(upstream_response.status_code):
-                _mark_timeout_failover(
+                _maybe_mark_upstream_failover(
                     upstream,
                     RuntimeError(f"HTTP {upstream_response.status_code} upstream timeout response"),
+                    auto_failover_enabled,
+                    label="Timeout",
                 )
 
             if "application/json" in content_type.lower():
@@ -342,9 +469,9 @@ def relay_request(subpath: str):
             )
         except httpx.TimeoutException as exc:
             last_error = str(exc)
-            _mark_timeout_failover(upstream, exc)
+            _maybe_mark_upstream_failover(upstream, exc, auto_failover_enabled, label="Timeout")
             _passive_health(upstream["id"], False, None)
-            if index < len(candidates) - 1:
+            if auto_failover_enabled and index < len(candidates) - 1:
                 if client:
                     client.close()
                 continue
@@ -364,8 +491,9 @@ def relay_request(subpath: str):
                 client.close()
         except httpx.HTTPError as exc:
             last_error = str(exc)
+            _maybe_mark_upstream_failover(upstream, exc, auto_failover_enabled)
             _passive_health(upstream["id"], False, None)
-            if index < len(candidates) - 1:
+            if auto_failover_enabled and index < len(candidates) - 1:
                 if client:
                     client.close()
                 continue
