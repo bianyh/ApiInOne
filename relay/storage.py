@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
+import sqlite3
 import threading
 from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -181,43 +189,127 @@ class RequestLogStore:
 
 class ObjectIndexStore:
     def __init__(self, data_dir: str | Path):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.data_dir / "object-index.json"
-        self._lock = threading.RLock()
-        if not self.path.exists():
-            self.path.write_text("{}", encoding="utf-8")
+        directory = Path(data_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / "object-index.sqlite3"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
+                connection.execute(
+                    """
+                    CREATE TABLE object_index (
+                        object_id TEXT PRIMARY KEY NOT NULL,
+                        upstream_id TEXT NOT NULL,
+                        object_type TEXT,
+                        updated_at TEXT
+                    )
+                    """
+                )
+                self._import_legacy(connection, directory / "object-index.json")
+                connection.execute("PRAGMA user_version = 1")
 
-    def _load(self) -> dict[str, Any]:
-        return json.loads(self.path.read_text(encoding="utf-8") or "{}")
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=10)) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            yield connection
 
-    def _save(self, payload: dict[str, Any]) -> None:
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    @staticmethod
+    def _import_legacy(connection: sqlite3.Connection, path: Path) -> None:
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return
+        try:
+            raw = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raw = data[:exc.start].decode("utf-8")
+        try:
+            entries = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            entries = _recover_object_index(raw)
+            logger.warning("Recovered %d complete entries from damaged object index %s", len(entries), path)
+        if not isinstance(entries, dict):
+            logger.warning("Expected an object in legacy object index %s", path)
+            return
+
+        connection.executemany(
+            "INSERT INTO object_index VALUES (?, ?, ?, ?)",
+            (
+                (
+                    object_id,
+                    entry["upstream_id"],
+                    entry.get("object_type") if isinstance(entry.get("object_type"), str) else None,
+                    entry.get("updated_at") if isinstance(entry.get("updated_at"), str) else None,
+                )
+                for object_id, entry in entries.items()
+                if object_id and isinstance(entry, dict)
+                and isinstance(entry.get("upstream_id"), str) and entry["upstream_id"]
+            ),
+        )
 
     def get(self, object_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            return self._load().get(object_id)
+        return self.match_from_segments([object_id])
 
     def upsert(self, object_id: str, upstream_id: str, object_type: str | None = None) -> None:
-        if not object_id or not upstream_id:
+        self.upsert_many([(object_id, object_type)], upstream_id)
+
+    def upsert_many(self, objects: Iterable[tuple[str, str | None]], upstream_id: str) -> None:
+        if not upstream_id:
             return
-        with self._lock:
-            payload = self._load()
-            payload[object_id] = {
-                "object_id": object_id,
-                "upstream_id": upstream_id,
-                "object_type": object_type or payload.get(object_id, {}).get("object_type"),
-                "updated_at": _utc_now_iso(),
-            }
-            self._save(payload)
+        now = _utc_now_iso()
+        rows = [
+            (object_id, upstream_id, object_type or None, now)
+            for object_id, object_type in objects
+            if object_id
+        ]
+        if rows:
+            with self._connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO object_index VALUES (?, ?, ?, ?)
+                    ON CONFLICT(object_id) DO UPDATE SET
+                        upstream_id = excluded.upstream_id,
+                        object_type = COALESCE(excluded.object_type, object_index.object_type),
+                        updated_at = excluded.updated_at
+                    """,
+                    rows,
+                )
 
     def match_from_segments(self, segments: list[str]) -> dict[str, Any] | None:
-        with self._lock:
-            payload = self._load()
+        with self._connect() as connection:
             for segment in segments:
-                if segment in payload:
-                    return payload[segment]
+                row = connection.execute(
+                    "SELECT * FROM object_index WHERE object_id = ?", (segment,)
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
         return None
+
+
+def _recover_object_index(raw: str) -> dict[str, Any]:
+    # The old writer saved a single JSON object. Decode complete entries before the damaged tail.
+    decoder = json.JSONDecoder()
+    whitespace = re.compile(r"\s*")
+    position = whitespace.match(raw).end()
+    entries = {}
+    if raw[position:position + 1] != "{":
+        return entries
+
+    while True:
+        try:
+            key, position = decoder.raw_decode(raw, whitespace.match(raw, position + 1).end())
+            position = whitespace.match(raw, position).end()
+            if not isinstance(key, str) or raw[position:position + 1] != ":":
+                break
+            value, position = decoder.raw_decode(raw, whitespace.match(raw, position + 1).end())
+        except json.JSONDecodeError:
+            break
+        entries[key] = value
+        position = whitespace.match(raw, position).end()
+        if raw[position:position + 1] != ",":
+            break
+    return entries
 
 
 class HealthStore:

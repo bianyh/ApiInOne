@@ -21,7 +21,8 @@
 - 支持上游模型自动探查，并把模型列表存储到本地配置中
 - 支持代理 Key 管理，客户端永远只使用代理 Key，不直接暴露上游 Key
 - 支持请求明细、调用次数、调用速率、Token 数据、延迟数据和健康状态图表
-- 不使用数据库，全部使用本地文件持久化
+- 本地持久化，对象归属索引使用 Python 自带的 SQLite
+- 支持在管理台设置模型名映射和自动故障切换
 - 前端直接依赖 CDN 的 `Vue 3 + Element Plus + ECharts`
 
 ## 管理台功能
@@ -166,6 +167,24 @@ api_key = "管理台创建出来的 sk-relay-..."
 
 也就是说，客户端依旧按 OpenAI 风格去请求，只是把入口地址换成你的中转站。
 
+### Codex
+
+在客户端的 `config.toml` 中配置自定义供应商。把地址改为你的中转站，将代理 Key 放入 `RELAY_API_KEY` 环境变量。
+
+```toml
+model = "gpt-6.2-sol"
+model_provider = "apiinone"
+
+[model_providers.apiinone]
+name = "ApiInOne"
+base_url = "https://relay.example.com/v1"
+env_key = "RELAY_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+```
+
+Codex 会使用 `POST /v1/responses`。在管理台将客户端使用的模型名加入具有 Responses 能力的上游节点，并验证该模型的流式 Responses 请求。 [Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)
+
 ## 配置文件与数据文件
 
 运行时会自动生成本地文件：
@@ -178,8 +197,8 @@ api_key = "管理台创建出来的 sk-relay-..."
   - 请求明细
 - `data/metrics-YYYY-MM-DD.json`
   - 聚合统计
-- `data/object-index.json`
-  - 对象归属索引
+- `data/object-index.sqlite3`
+  - 对象归属索引。启动时自动导入旧版 `data/object-index.json` 中完整的记录，旧文件可用于备份。
 - `data/health.json`
   - 健康状态与探活结果
 
@@ -210,7 +229,7 @@ api_key = "管理台创建出来的 sk-relay-..."
 探活逻辑分两步：
 
 1. 请求上游 `/v1/models`，确认模型列表结构有效
-2. 用一个 `hi` 的流式 `/v1/chat/completions` 请求确认节点能正常返回有效内容
+2. 用一个 `hi` 的流式请求确认节点能正常返回有效内容，接口可选 `/v1/chat/completions` 或 `/v1/responses`
 
 默认探活模型为 `gpt-5.4`，也可以在前端选择该节点已探测到的其他模型进行探活。
 
@@ -229,7 +248,6 @@ api_key = "管理台创建出来的 sk-relay-..."
 - 自动费用计算
 - 限流
 - 历史日志自动清理
-- 模型名映射
 
 ## 测试
 

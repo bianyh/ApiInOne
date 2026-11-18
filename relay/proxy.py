@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlencode
 
@@ -164,16 +165,19 @@ def _build_upstream_request_kwargs(upstream_api_key: str, ctx: dict[str, Any]) -
 
 
 def _index_response_objects(store: ObjectIndexStore, upstream_id: str, payload: Any) -> None:
-    if isinstance(payload, dict):
-        object_id = payload.get("id")
-        object_type = payload.get("object")
-        if isinstance(object_id, str):
-            store.upsert(object_id, upstream_id, object_type)
-        for value in payload.values():
-            _index_response_objects(store, upstream_id, value)
-    elif isinstance(payload, list):
-        for item in payload:
-            _index_response_objects(store, upstream_id, item)
+    def object_ids(value: Any) -> Iterator[tuple[str, str | None]]:
+        if isinstance(value, dict):
+            object_id = value.get("id")
+            object_type = value.get("object")
+            if isinstance(object_id, str):
+                yield object_id, object_type if isinstance(object_type, str) else None
+            for child in value.values():
+                yield from object_ids(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from object_ids(child)
+
+    store.upsert_many(object_ids(payload), upstream_id)
 
 
 def _build_log_record(
@@ -218,22 +222,22 @@ def _build_log_record(
 
 class _StreamUsageTracker:
     def __init__(self) -> None:
-        self.buffer = ""
+        self.buffer = b""
         self.last_payload: dict[str, Any] | None = None
 
     def feed(self, chunk: bytes) -> None:
-        self.buffer += chunk.decode("utf-8", errors="ignore")
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
+        self.buffer += chunk
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
             stripped = line.strip()
-            if not stripped.startswith("data:"):
+            if not stripped.startswith(b"data:"):
                 continue
             data = stripped[5:].strip()
-            if not data or data == "[DONE]":
+            if not data or data == b"[DONE]":
                 continue
             try:
                 parsed = json.loads(data)
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if isinstance(parsed, dict):
                 self.last_payload = parsed
@@ -377,13 +381,15 @@ def relay_request(subpath: str):
                     nonlocal ttfb_ms, response_payload
                     first_chunk_seen = False
                     try:
-                        for chunk in upstream_response.iter_raw():
+                        for chunk in upstream_response.iter_bytes():
                             if not first_chunk_seen:
                                 ttfb_ms = round((time.perf_counter() - started) * 1000, 2)
                                 first_chunk_seen = True
                             tracker.feed(chunk)
                             yield chunk
                     finally:
+                        upstream_response.close()
+                        client.close()
                         duration_ms = round((time.perf_counter() - started) * 1000, 2)
                         response_payload = tracker.last_payload
                         if response_payload is not None:
@@ -399,8 +405,6 @@ def relay_request(subpath: str):
                             response_payload=response_payload,
                         )
                         _log_request(record, proxy_key["id"])
-                        upstream_response.close()
-                        client.close()
 
                 response_headers = {
                     key: value

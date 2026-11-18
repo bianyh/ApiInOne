@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import socket
 from io import BytesIO
+
+import httpx
 
 from tests.conftest import provision_relay
 
@@ -300,6 +303,32 @@ def test_streaming_proxy(client, app, upstream_factory):
 
     records = app.extensions["relay_state"].request_store.query(page=1, page_size=10)
     assert records["items"][0]["ttfb_ms"] is not None
+
+
+def test_streaming_proxy_decodes_compressed_sse(client, app, upstream_factory, monkeypatch):
+    upstream = upstream_factory("compressed", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    event = b'data: {"type":"response.completed","response":{"id":"resp_compressed"}}\n\n'
+
+    def respond(request):
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream", "Content-Encoding": "gzip"},
+            stream=httpx.ByteStream(gzip.compress(event)),
+        )
+
+    upstream_client = httpx.Client
+    monkeypatch.setattr(
+        "relay.proxy.httpx.Client", lambda **kwargs: upstream_client(transport=httpx.MockTransport(respond), **kwargs)
+    )
+    response = client.post(
+        "/v1/responses",
+        json={"model": "gpt-4.1", "input": "hello", "stream": True},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.get_data() == event
+    assert "Content-Encoding" not in response.headers
+    assert app.extensions["relay_state"].object_store.get("resp_compressed")["upstream_id"] == "compressed_id"
 
 
 def test_multipart_file_upload_and_index_lookup(client, app, upstream_factory):

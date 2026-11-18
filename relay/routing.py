@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from relay.storage import HealthStore, ObjectIndexStore
+from relay.utils import should_expect_indexed_object
 
 
 def build_upstream_url(base_url: str, incoming_path: str) -> str:
@@ -76,14 +77,11 @@ def select_candidates(
 
 
 def resolve_bound_upstream(path: str, object_store: ObjectIndexStore) -> tuple[str | None, bool]:
-    segments = [segment for segment in path.split("/") if segment]
-    match = object_store.match_from_segments(segments)
-    if match:
-        return match["upstream_id"], False
-
-    if len(segments) < 3 or segments[0] != "v1":
+    if not should_expect_indexed_object(path):
         return None, False
 
-    if segments[1] in {"files", "vector_stores", "assistants", "threads", "batches", "responses"}:
-        return None, True
-    return None, False
+    segments = [segment for segment in path.split("/") if segment]
+    match = object_store.match_from_segments(segments[2:])
+    if match:
+        return match["upstream_id"], False
+    return None, True

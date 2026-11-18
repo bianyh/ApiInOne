@@ -75,6 +75,8 @@ def should_expect_indexed_object(path: str) -> bool:
     if len(segments) < 3 or segments[0] != "v1":
         return False
     root = segments[1]
+    if root == "responses" and segments[2] in {"compact", "input_tokens"}:
+        return False
     object_roots = {
         "files",
         "vector_stores",
@@ -83,4 +85,4 @@ def should_expect_indexed_object(path: str) -> bool:
         "batches",
         "responses",
     }
-    return root in object_roots and len(segments) >= 3
+    return root in object_roots
