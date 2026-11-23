@@ -13,7 +13,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from relay.config_store import ConfigStore
 from relay.routing import build_upstream_url
 from relay.storage import HealthStore
-from relay.utils import normalize_timeout_seconds, utc_now_iso
+from relay.utils import utc_now_iso
 
 
 _NON_TEXT_MODEL_HINTS = (
@@ -377,7 +377,7 @@ class HealthProbeService:
         hi_excerpt = None
         try:
             with httpx.Client(
-                timeout=httpx.Timeout(normalize_timeout_seconds(upstream.get("timeout_ms", 10000))),
+                timeout=None,
             ) as client:
                 _record_step(
                     steps,

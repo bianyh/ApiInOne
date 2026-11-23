@@ -40,6 +40,15 @@ def hash_proxy_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
+def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
+    config = _deep_merge(DEFAULT_CONFIG, raw)
+    # Discard legacy deadlines on load and save, including existing deployments.
+    config["app"].pop("request_timeout_ms", None)
+    for upstream in config["upstreams"]:
+        upstream.pop("timeout_ms", None)
+    return config
+
+
 def normalize_model_mappings(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -70,7 +79,7 @@ class ConfigStore:
     def _load_yaml(self) -> dict[str, Any]:
         with self.config_path.open(encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
-            config = _deep_merge(DEFAULT_CONFIG, raw)
+            config = _normalize_config(raw)
             self._signature = self._file_signature(os.fstat(handle.fileno()))
         return config
 
@@ -108,7 +117,7 @@ class ConfigStore:
 
     def save_config(self, new_config: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            merged = _deep_merge(DEFAULT_CONFIG, new_config)
+            merged = _normalize_config(new_config)
             self._write_yaml(merged)
             self._config = merged
             return copy.deepcopy(self._config)
@@ -150,11 +159,6 @@ class ConfigStore:
                             for item in upstream.get("allowed_models", [])
                             if str(item).strip()
                         ],
-                        "timeout_ms": int(
-                            upstream.get("timeout_ms")
-                            or (current or {}).get("timeout_ms")
-                            or config["app"]["request_timeout_ms"]
-                        ),
                         "probe_enabled": bool(upstream.get("probe_enabled", True)),
                         "endpoint_capabilities": upstream.get(
                             "endpoint_capabilities",

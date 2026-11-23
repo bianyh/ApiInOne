@@ -21,7 +21,9 @@ class MockUpstreamServer:
         name: str,
         models: list[str],
         fail_responses: int = 0,
-        delay_stream: bool = False,
+        failure_status_code: int = 500,
+        stream_delay_seconds: float = 0.0,
+        models_delay_seconds: float = 0.0,
         models_mode: str = "valid",
         completion_mode: str = "valid",
         response_delay_seconds: float = 0.0,
@@ -30,7 +32,9 @@ class MockUpstreamServer:
         self.name = name
         self.models = models
         self.fail_responses = fail_responses
-        self.delay_stream = delay_stream
+        self.failure_status_code = failure_status_code
+        self.stream_delay_seconds = stream_delay_seconds
+        self.models_delay_seconds = models_delay_seconds
         self.models_mode = models_mode
         self.completion_mode = completion_mode
         self.response_delay_seconds = response_delay_seconds
@@ -52,6 +56,7 @@ class MockUpstreamServer:
         @self._app.get("/v1/models")
         def models():
             self.models_calls += 1
+            time.sleep(self.models_delay_seconds)
             if self.models_mode == "invalid_json":
                 return Response("not-json", mimetype="text/plain")
             if self.models_mode == "wrong_shape":
@@ -74,13 +79,14 @@ class MockUpstreamServer:
             self.last_response_form = request.form.to_dict(flat=True)
             if self.fail_responses > 0:
                 self.fail_responses -= 1
-                return jsonify({"error": {"message": "temporary failure"}}), 500
+                return jsonify({"error": {"message": "temporary failure"}}), self.failure_status_code
 
             if payload.get("stream"):
                 response_id = f"resp_{self.name}"
 
                 def generate():
                     yield f'data: {{"type":"response.created","response":{{"id":"{response_id}","object":"response"}}}}\n\n'
+                    time.sleep(self.stream_delay_seconds)
                     yield 'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
                     yield 'data: {"type":"response.output_text.delta","delta":"!"}\n\n'
                     yield (
@@ -108,6 +114,7 @@ class MockUpstreamServer:
             }
             if self.response_delay_seconds > 0:
                 def delayed_body():
+                    yield " "
                     time.sleep(self.response_delay_seconds)
                     yield json.dumps(response_payload)
 
@@ -239,6 +246,9 @@ def upstream_factory():
         name: str,
         models: list[str],
         fail_responses: int = 0,
+        failure_status_code: int = 500,
+        stream_delay_seconds: float = 0.0,
+        models_delay_seconds: float = 0.0,
         models_mode: str = "valid",
         completion_mode: str = "valid",
         response_delay_seconds: float = 0.0,
@@ -248,6 +258,9 @@ def upstream_factory():
             name=name,
             models=models,
             fail_responses=fail_responses,
+            failure_status_code=failure_status_code,
+            stream_delay_seconds=stream_delay_seconds,
+            models_delay_seconds=models_delay_seconds,
             models_mode=models_mode,
             completion_mode=completion_mode,
             response_delay_seconds=response_delay_seconds,

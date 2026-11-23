@@ -2,7 +2,6 @@ app:
   title: ApiInOne
   route_mode: ordered_failover
   probe_interval_seconds: 300
-  request_timeout_ms: 120000
   passive_window_size: 50
 
 upstreams: []
@@ -16,7 +15,6 @@ upstreams: []
 #   allowed_models:
 #     - gpt-5.4
 #     - gpt-4.1
-#   timeout_ms: 120000
 #   probe_enabled: true
 #   endpoint_capabilities:
 #     - "*"

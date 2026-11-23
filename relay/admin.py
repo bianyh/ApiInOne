@@ -33,17 +33,11 @@ def _existing_upstream_map() -> dict[str, dict[str, Any]]:
 def _resolve_upstream_credentials(payload: dict[str, Any]) -> dict[str, Any]:
     existing = _existing_upstream_map()
     current = existing.get(payload.get("id") or payload.get("upstream_id") or "", {})
-    app_settings = get_state().config_store.get_app_settings()
     return {
         "id": payload.get("id") or current.get("id"),
         "name": (payload.get("name") or current.get("name") or "").strip(),
         "base_url": (payload.get("base_url") or current.get("base_url") or "").strip(),
         "api_key": payload.get("api_key") or current.get("api_key") or "",
-        "timeout_ms": int(
-            payload.get("timeout_ms")
-            or current.get("timeout_ms")
-            or app_settings.get("request_timeout_ms", 120000)
-        ),
     }
 
 
@@ -52,7 +46,6 @@ def _auto_fill_models(upstream: dict[str, Any]) -> dict[str, Any]:
     discovered = discover_upstream_models(
         resolved["base_url"],
         resolved["api_key"],
-        resolved["timeout_ms"],
     )
     upstream["allowed_models"] = discovered["models"]
     upstream["models_detected_at"] = discovered["discovered_at"]
@@ -136,7 +129,6 @@ def discover_upstream():
         result = discover_upstream_models(
             resolved["base_url"],
             resolved["api_key"],
-            resolved["timeout_ms"],
         )
     except UpstreamDiscoveryError as exc:
         return jsonify({"error": {"message": str(exc)}}), 400
@@ -198,7 +190,6 @@ def update_settings():
         "model_mappings",
         "scheduled_probe_all_enabled",
         "probe_interval_seconds",
-        "request_timeout_ms",
         "passive_window_size",
     }
     patch = {key: value for key, value in payload.items() if key in allowed_fields}

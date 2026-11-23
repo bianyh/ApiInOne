@@ -671,8 +671,8 @@
                     :disabled="!settings.scheduled_probe_all_enabled"
                   ></el-input-number>
                 </el-form-item>
-                <el-form-item label="默认超时（毫秒）">
-                  <el-input-number v-model="settings.request_timeout_ms" :min="1000" :step="1000"></el-input-number>
+                <el-form-item label="上游等待">
+                  <span>不限时，持续等待上游响应及流式输出。</span>
                 </el-form-item>
                 <el-button type="primary" @click="saveSettings" :loading="loading.settings">保存设置</el-button>
               </el-form>
@@ -695,14 +695,9 @@
                 <el-form-item label="Base URL">
                   <el-input v-model="upstreamDialog.form.base_url" placeholder="例如 https://api.openai.com/v1"></el-input>
                 </el-form-item>
-                <div class="double-grid">
-                  <el-form-item label="当前顺序">
-                    <el-input :model-value="`第 ${upstreamDialog.form.order || '-'} 位`" disabled></el-input>
-                  </el-form-item>
-                  <el-form-item label="超时（毫秒）">
-                    <el-input-number v-model="upstreamDialog.form.timeout_ms" :min="1000" :step="1000" controls-position="right"></el-input-number>
-                  </el-form-item>
-                </div>
+                <el-form-item label="当前顺序">
+                  <el-input :model-value="`第 ${upstreamDialog.form.order || '-'} 位`" disabled></el-input>
+                </el-form-item>
                 <el-form-item label="API Key">
                   <el-input
                     v-model="upstreamDialog.form.api_key"

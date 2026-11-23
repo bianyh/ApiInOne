@@ -7,6 +7,7 @@ from io import BytesIO
 
 import httpx
 import pytest
+import yaml
 from werkzeug.test import EnvironBuilder
 from werkzeug.wrappers import Request as WsgiRequest
 
@@ -52,6 +53,60 @@ def test_proxy_json_request_and_usage_logging(client, app, upstream_factory):
     assert item["input_tokens"] == 20
     assert item["cached_tokens"] == 4
     assert item["reasoning_tokens"] == 3
+
+
+@pytest.mark.parametrize("phase", ["headers", "json_body", "stream"])
+def test_slow_upstream_ignores_legacy_deadlines(client, app, upstream_factory, phase):
+    upstream = upstream_factory(
+        "slow",
+        ["gpt-4.1"],
+        chat_delay_seconds=0.2 if phase == "headers" else 0.0,
+        response_delay_seconds=0.2 if phase == "json_body" else 0.0,
+        stream_delay_seconds=0.2 if phase == "stream" else 0.0,
+    )
+    proxy_key = provision_relay(app, [upstream])
+    state = app.extensions["relay_state"]
+    # Simulate an existing deployment, including an on-disk configuration reload.
+    config = state.config_store.get_config()
+    config["app"]["request_timeout_ms"] = 50
+    config["upstreams"][0]["timeout_ms"] = 50
+    state.config_store.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    response = client.post(
+        "/v1/chat/completions" if phase == "headers" else "/v1/responses",
+        json={"model": "gpt-4.1", "input": "hello", "stream": phase == "stream"},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.status_code == 200
+    if phase == "stream":
+        assert "response.completed" in response.get_data(as_text=True)
+    else:
+        assert response.get_json()["id"] in {"chat_slow", "resp_slow"}
+    records = state.request_store.query(page=1, page_size=10)["items"]
+    assert records[0]["status_code"] == 200
+    assert records[0]["duration_ms"] >= 150
+
+
+def test_forwarding_disables_every_http_timeout(client, app, upstream_factory):
+    upstream = upstream_factory("deadlines", ["gpt-4.1"])
+    proxy_key = provision_relay(app, [upstream])
+    state = app.extensions["relay_state"]
+    observed = []
+
+    def respond(request):
+        observed.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"id": "resp_no_deadline"})
+
+    state.upstream_client.close()
+    # Even a replacement client with finite defaults must forward without deadlines.
+    state.upstream_client = httpx.Client(timeout=0.05, transport=httpx.MockTransport(respond))
+    response = client.post(
+        "/v1/responses",
+        json={"model": "gpt-4.1", "input": "hello"},
+        headers={"Authorization": f"Bearer {proxy_key}"},
+    )
+    assert response.status_code == 200
+    assert observed == [{"connect": None, "read": None, "write": None, "pool": None}]
 
 
 def test_proxy_rebuilds_forward_headers_as_local_request(client, app, upstream_factory):
@@ -481,11 +536,12 @@ def test_multipart_file_upload_and_index_lookup(client, app, upstream_factory):
     assert get_response.get_json()["id"] == file_id
 
 
-def test_timeout_failover_skips_timed_out_higher_priority_upstream(client, app, upstream_factory):
+def test_upstream_timeout_status_failover_skips_higher_priority_upstream(client, app, upstream_factory):
     timed_out = upstream_factory(
         "timed_out",
         ["gpt-4.1"],
-        response_delay_seconds=0.25,
+        fail_responses=1,
+        failure_status_code=504,
     )
     healthy = upstream_factory("healthy", ["gpt-4.1"])
     state = app.extensions["relay_state"]
@@ -542,11 +598,12 @@ def test_timeout_failover_skips_timed_out_higher_priority_upstream(client, app, 
     assert healthy.responses_calls == 2
 
 
-def test_recovery_probe_restores_higher_priority_upstream_after_timeout(client, app, upstream_factory):
+def test_recovery_probe_restores_upstream_after_timeout_status(client, app, upstream_factory):
     recovering = upstream_factory(
         "recovering",
         ["gpt-4.1", "gpt-5.4"],
-        response_delay_seconds=0.25,
+        fail_responses=1,
+        failure_status_code=504,
         chat_delay_seconds=0.0,
     )
     healthy = upstream_factory("healthy", ["gpt-4.1", "gpt-5.4"])
@@ -595,7 +652,6 @@ def test_recovery_probe_restores_higher_priority_upstream_after_timeout(client, 
     assert recovery["recovering_id"]["last_probe_model_used"] == "gpt-5.4"
     assert state.health_store.get_all()["recovering_id"]["timeout_failover_active"] is False
 
-    recovering.response_delay_seconds = 0.0
     second = client.post(
         "/v1/responses",
         json={"model": "gpt-4.1", "input": "again"},

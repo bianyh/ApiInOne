@@ -11,17 +11,6 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def normalize_timeout_seconds(timeout_ms: Any, default_ms: int = 120000, minimum_ms: int = 50) -> float:
-    try:
-        resolved_ms = int(timeout_ms)
-    except (TypeError, ValueError):
-        resolved_ms = int(default_ms)
-    if resolved_ms <= 0:
-        resolved_ms = int(default_ms)
-    resolved_ms = max(resolved_ms, int(minimum_ms))
-    return float(resolved_ms) / 1000.0
-
-
 def parse_json_bytes(data: bytes) -> dict[str, Any] | None:
     if not data:
         return None

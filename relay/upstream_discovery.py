@@ -6,14 +6,14 @@ from typing import Any
 import httpx
 
 from relay.routing import build_upstream_url
-from relay.utils import normalize_timeout_seconds, utc_now_iso
+from relay.utils import utc_now_iso
 
 
 class UpstreamDiscoveryError(Exception):
     pass
 
 
-def discover_upstream_models(base_url: str, api_key: str, timeout_ms: int) -> dict[str, Any]:
+def discover_upstream_models(base_url: str, api_key: str) -> dict[str, Any]:
     normalized_base_url = (base_url or "").strip().rstrip("/")
     normalized_api_key = (api_key or "").strip()
     if not normalized_base_url:
@@ -24,7 +24,7 @@ def discover_upstream_models(base_url: str, api_key: str, timeout_ms: int) -> di
     started = time.perf_counter()
     try:
         with httpx.Client(
-            timeout=httpx.Timeout(normalize_timeout_seconds(timeout_ms)),
+            timeout=None,
             follow_redirects=True,
         ) as client:
             response = client.get(

@@ -23,7 +23,6 @@ from relay.usage import detect_fast_flag, extract_usage
 from relay.utils import (
     extract_model_from_request,
     infer_endpoint_family,
-    normalize_timeout_seconds,
     parse_json_bytes,
     utc_now_iso,
 )
@@ -522,7 +521,8 @@ def relay_request(subpath: str):
                 client.build_request(
                     request.method,
                     target_url,
-                    timeout=httpx.Timeout(normalize_timeout_seconds(upstream.get("timeout_ms", 120000))),
+                    # Never expire a request while the upstream is still working.
+                    timeout=None,
                     **request_kwargs,
                 ),
                 stream=True,

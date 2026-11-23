@@ -38,7 +38,6 @@
           model_mappings: {},
           scheduled_probe_all_enabled: false,
           probe_interval_seconds: 300,
-          request_timeout_ms: 120000,
         },
         modelMappingRows: [],
         upstreams: [],
@@ -202,7 +201,6 @@
           api_key: "",
           api_key_masked: "",
           order: this.upstreams.length + 1,
-          timeout_ms: this.settings.request_timeout_ms || 120000,
           enabled: true,
           probe_enabled: true,
           endpoint_capabilities: ["*"],
@@ -235,7 +233,6 @@
           api_key: "",
           api_key_masked: item.api_key_masked || "",
           order: item.order || index + 1,
-          timeout_ms: item.timeout_ms || this.settings.request_timeout_ms || 120000,
           enabled: item.enabled !== false,
           probe_enabled: item.probe_enabled !== false,
           endpoint_capabilities: Array.isArray(item.endpoint_capabilities) && item.endpoint_capabilities.length
@@ -679,7 +676,6 @@
             id: form.id,
             base_url: form.base_url,
             api_key: form.api_key,
-            timeout_ms: form.timeout_ms,
           },
           silent,
         );
@@ -726,7 +722,6 @@
           base_url: item.base_url,
           api_key: item.api_key,
           order: item.order || index + 1,
-          timeout_ms: item.timeout_ms,
           enabled: item.enabled,
           probe_enabled: item.probe_enabled,
           endpoint_capabilities: item.endpoint_capabilities,
@@ -780,7 +775,6 @@
           {
             id: item.id,
             base_url: item.base_url,
-            timeout_ms: item.timeout_ms,
           },
           false,
         );

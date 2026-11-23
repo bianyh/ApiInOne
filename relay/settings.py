@@ -26,7 +26,6 @@ DEFAULT_CONFIG = {
         "model_mappings": {},
         "scheduled_probe_all_enabled": False,
         "probe_interval_seconds": 300,
-        "request_timeout_ms": 120000,
         "passive_window_size": 50,
     },
     "upstreams": [],

@@ -40,6 +40,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     health_store = HealthStore(config_store.data_dir)
     health_service = HealthProbeService(config_store, health_store)
     upstream_client = httpx.Client(
+        timeout=None,
         follow_redirects=True,
         limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
         cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),

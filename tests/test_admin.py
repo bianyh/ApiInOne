@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from tests.conftest import login_admin
+from relay.config_store import ConfigStore
+from tests.conftest import login_admin, provision_relay
 
 
 def test_admin_dashboard_renders(client):
@@ -49,6 +51,46 @@ def test_admin_login_and_settings_roundtrip(client):
     assert settings_response.get_json()["item"]["auto_failover_enabled"] is False
     assert settings_response.get_json()["item"]["scheduled_probe_all_enabled"] is True
     assert settings_response.get_json()["item"]["model_mappings"] == {"gpt-5.5": "gpt-5.4"}
+    assert "request_timeout_ms" not in settings_response.get_json()["item"]
+
+
+def test_legacy_upstream_deadlines_are_removed_on_load_and_save(app, upstream_factory):
+    upstream = upstream_factory("legacy", ["gpt-4.1"])
+    provision_relay(app, [upstream])
+    store = app.extensions["relay_state"].config_store
+    config = store.get_config()
+    config["app"]["request_timeout_ms"] = 50
+    config["upstreams"][0]["timeout_ms"] = 50
+    store.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    reloaded = ConfigStore(store.config_path)
+    assert "request_timeout_ms" not in reloaded.get_app_settings()
+    assert "timeout_ms" not in reloaded.list_upstreams()[0]
+    reloaded.save_config(config)
+    saved = yaml.safe_load(store.config_path.read_text(encoding="utf-8"))
+    assert "request_timeout_ms" not in saved["app"]
+    assert "timeout_ms" not in saved["upstreams"][0]
+    assert saved["upstreams"][0]["api_key"] == "up-legacy"
+
+
+def test_slow_discovery_and_probe_ignore_legacy_deadlines(client, app, upstream_factory):
+    upstream = upstream_factory(
+        "slow-probe", ["gpt-5.4"], models_delay_seconds=0.2, chat_delay_seconds=0.2,
+    )
+    provision_relay(app, [upstream])
+    state = app.extensions["relay_state"]
+    session = login_admin(client)
+    response = client.post(
+        "/admin/api/upstreams/discover",
+        json={"id": "slow-probe_id", "timeout_ms": 50},
+        headers={"X-CSRF-Token": session["csrf_token"]},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["item"]["models"] == ["gpt-5.4"]
+    node = state.config_store.list_upstreams()[0]
+    node["timeout_ms"] = 50
+    result = state.health_service.probe_one(node)
+    assert result["last_probe_success"] is True
 
 
 def test_scheduled_probe_all_job_is_disabled_by_default(app):
